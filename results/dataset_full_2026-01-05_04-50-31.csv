@@ -1,0 +1,5 @@
+Circuit,Solver,Wire_ID,Time_Sec,Status,Label
+c17.aag,g3,12,0.000045,SAT,1
+c17.aag,g3,13,0.000008,SAT,1
+c17.aag,m22,12,0.000009,SAT,1
+c17.aag,m22,13,0.000003,SAT,1
