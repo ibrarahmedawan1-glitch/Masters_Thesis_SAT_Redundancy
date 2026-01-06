@@ -36,6 +36,6 @@ This repository contains the source code and experimental data for the thesis **
 Experimental results demonstrate that **Glucose 4** offers the optimal balance of speed and stability for this specific domain, while **Lingeling** suffers from high initialization overhead on smaller combinational circuits.
 
 ## Author
-* **Name:** [Your Name]
-* **Institution:** [Your University]
+* **Name:** [Ibrar Ahmed Awan]
+* **Institution:** [University Of Freiburg]
 * **Year:** 2026
