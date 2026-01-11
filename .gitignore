@@ -1,9 +1,3 @@
-venv/
+*.o
 __pycache__/
-*.log
-*.aag
-venv/
-__pycache__/
-*.pyc
-.DS_Store
-benchmarks/*.aag
+.venv/
