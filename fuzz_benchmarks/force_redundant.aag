@@ -1,28 +1,0 @@
-aig 71 15 0 16 56
-49
-51
-53
-55
-81
-83
-85
-86
-97
-107
-109
-127
-128
-130
-133
-143
-	0(1%'	48HKNMONVXS	vxuokc
-aigfuzz -1 100
-seed 100
-fuzzer layers
-depth 2
-width 17
-input fraction 0%
-latch fraction 4%
-lower fraction 30%
-monotonicity -1
-xor closure
