@@ -1,0 +1,11 @@
+Circuit_Name,Type,Gates_Before,Gates_After,Removed,Status
+random_1.aig,Random,50,50,0,Optimal
+random_2.aig,Random,477,477,0,Optimal
+random_3.aig,Random,477,477,0,Optimal
+random_4.aig,Random,719,719,0,Optimal
+random_5.aig,Random,92,92,0,Optimal
+redundant_6.aig,Forced,2,2,0,Optimal
+redundant_7.aig,Forced,6,6,0,Optimal
+redundant_8.aig,Forced,2,2,0,Optimal
+redundant_9.aig,Forced,2,2,0,Optimal
+redundant_10.aig,Forced,2,2,0,Optimal

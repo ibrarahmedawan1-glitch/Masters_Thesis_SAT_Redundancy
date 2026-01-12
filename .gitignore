@@ -1,3 +1,34 @@
-*.o
+# --- Python Basics ---
 __pycache__/
-.venv/
+*.py[cod]
+venv/
+.env
+
+# --- Thesis Experiment Output ---
+# We generally do NOT want to track thousands of generated random circuits
+thesis_benchmarks/
+normalization_demo/
+bench_demo/
+iscas_benchmarks/
+
+# --- Temporary EDA Files ---
+*.aig
+*.aag
+*.blif
+# Keep .bench and .v if they are your SOURCE, but ignore generated ones
+# If you have a specific folder for source files, keep it (see exceptions below)
+
+# --- Tool Binaries (Don't track the tools themselves if they are compiled) ---
+abc/
+aiger/
+yosys/
+
+# --- Operating System Junk ---
+.DS_Store
+Thumbs.db
+
+# --- Exceptions (Rules to force-keep specific things) ---
+# We DO want to keep your results summary!
+!thesis_benchmarks/thesis_results_final.csv
+# We DO want to keep your source Verilog files
+!verilog_files/
