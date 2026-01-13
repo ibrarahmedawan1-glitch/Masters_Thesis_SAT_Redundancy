@@ -1,0 +1,13 @@
+# Thesis Demo
+INPUT(A)
+INPUT(B)
+OUTPUT(g1)
+OUTPUT(g2)
+OUTPUT(g3)
+
+# Redundancy 1: A & A
+g1 = AND(A, A)
+
+# Redundancy 2: Duplicate Gates
+g2 = AND(A, B)
+g3 = AND(A, B)

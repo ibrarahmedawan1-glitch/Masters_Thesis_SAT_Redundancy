@@ -1,0 +1,45 @@
+aig 55 10 6 23 39
+35
+37
+39
+3
+41
+23
+51
+52
+54
+57
+58
+60
+63
+73
+74
+77
+79
+81
+83
+85
+86
+88
+90
+92
+95
+96
+107
+109
+110
+"%
+
+,3)4"8
+:H87D<D:J
+PELEN^	c
+aigfuzz -1 290
+seed 290
+fuzzer layers
+depth 2
+width 17
+input fraction 15%
+latch fraction 39%
+lower fraction 50%
+monotonicity -1
+xor closure

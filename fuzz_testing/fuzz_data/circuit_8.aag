@@ -1,0 +1,30 @@
+aig 26 8 5 11 13
+34
+15
+23
+3
+45
+49
+47
+51
+43
+40
+39
+37
+52
+32
+31
+28
+	
+	#"
+.*c
+aigfuzz -1 261
+seed 261
+fuzzer layers
+depth 2
+width 54
+input fraction 13%
+latch fraction 98%
+lower fraction 20%
+monotonicity 1
+merge closure

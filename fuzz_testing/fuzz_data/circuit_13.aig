@@ -1,0 +1,26 @@
+aig 79 13 8 6 58
+44
+7
+31
+47
+48
+50
+8
+19
+77
+103
+137
+155
+157
+159
+	"	*&	A4>	D	U_S^R	eot	tsc
+aigfuzz -1 292
+seed 292
+fuzzer layers
+depth 2
+width 21
+input fraction 0%
+latch fraction 44%
+lower fraction 30%
+monotonicity 0
+xor closure

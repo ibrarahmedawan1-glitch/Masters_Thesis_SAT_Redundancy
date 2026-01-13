@@ -1,0 +1,45 @@
+aig 63 7 5 26 51
+8
+27
+28
+30
+32
+38
+40
+43
+45
+47
+52
+55
+56
+59
+60
+63
+74
+76
+86
+92
+94
+97
+98
+100
+103
+105
+106
+116
+119
+120
+126
+$
+ %')(/.0647
+F@PCJK[LNOVaZh^lfdc
+aigfuzz -1 298
+seed 298
+fuzzer layers
+depth 2
+width 33
+input fraction 3%
+latch fraction 81%
+lower fraction 20%
+monotonicity 0
+and closure
