@@ -1,4 +1,15 @@
+# Ignore Virtual Env
 venv/
 __pycache__/
 *.pyc
+
+# Ignore Generated Data (Clean Repo)
+dataset_benchmarks/
+results_optimized/
+*.strash.aag
+
+# Keep the final CSV reports if you want, or ignore them:
+# thesis_results_*.csv
+
+# OS junk
 .DS_Store
