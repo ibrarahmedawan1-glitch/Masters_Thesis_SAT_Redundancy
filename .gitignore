@@ -1,15 +1,22 @@
-# Ignore Virtual Env
+# Python Virtual Environment
 venv/
+.env
+
+# Python Bytecode and Cache
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
-# Ignore Generated Data (Clean Repo)
+# External Binaries (Environment-specific)
+abc/
+temp_faulty.aag
+
+# Pipeline Directories (Generated Data)
 dataset_benchmarks/
 results_optimized/
-*.strash.aag
 
-# Keep the final CSV reports if you want, or ignore them:
-# thesis_results_*.csv
-
-# OS junk
-.DS_Store
+# Temporary Algorithm Files
+*.temp.aag
+*.univ.aag
+*.pre.aag
