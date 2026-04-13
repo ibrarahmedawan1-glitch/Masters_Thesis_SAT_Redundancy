@@ -7,8 +7,7 @@ ABC_PATH = "./abc/abc"
 
 def count_reachable_gates(file_path):
     try:
-        if not os.path.exists(file_path): return 0
-        with open(file_path, 'r', errors='ignore') as f:
+        with open(file_path, 'r', errors='ignore') as f: 
             lines = [l.strip() for l in f if l.strip() and not l.startswith('c')]
         if not lines or not lines[0].startswith('aag'): return 0
         header = lines[0].split()
@@ -33,7 +32,6 @@ def count_reachable_gates(file_path):
     except: return 0
 
 def parse_aag_strict(filepath):
-    """Strict parser enforcing symbol table preservation."""
     with open(filepath, 'r') as f: 
         lines = [l.strip() for l in f if l.strip() and not l.startswith('c')]
     header = lines[0].split()
@@ -53,59 +51,29 @@ def write_aag_strict(filepath, M, I, L, O, A, inputs, latches, outputs, gates, s
         sym_l = [s for s in symbols if s.startswith('l')]
         sym_o = [s for s in symbols if s.startswith('o')]
         for s in sym_i + sym_l + sym_o: f.write(s + '\n')
-        f.write("c\nAlg2 Miter\n")
+        f.write("c\nAlg1 Miter\n")
 
-def build_universal_faulty_machine(current_aag, univ_aag):
-    M, I, L, O, A, inputs, latches, outputs, gates, symbols = parse_aag_strict(current_aag)
-    new_M, new_I, new_A = M + 2 * A, I + A, A * 2
-    new_inputs, new_gates = inputs.copy(), []
-    
-    for i, gate_line in enumerate(gates):
-        lhs, r1, r2 = map(int, gate_line.split())
-        var_E = M + i + 1
-        lit_E = var_E * 2
-        new_inputs.append(str(lit_E))
-        var_T = M + A + i + 1
-        lit_T = var_T * 2
-        new_gates.extend([f"{lit_T} {r1} {r2}", f"{lhs} {lit_T} {lit_E + 1}"]) 
-        
-    with open(univ_aag, 'w') as f:
-        f.write(f"aag {new_M} {new_I} {L} {O} {new_A}\n")
-        for x in new_inputs + latches + outputs + new_gates: f.write(str(x) + '\n')
-        
-        sym_i = [s for s in symbols if s.startswith('i')]
-        sym_l = [s for s in symbols if s.startswith('l')]
-        sym_o = [s for s in symbols if s.startswith('o')]
-        
-        for s in sym_i: f.write(s + '\n')
-        for idx in range(A): f.write(f"i{I + idx} fault_en_{idx}\n")
-        for s in sym_l + sym_o: f.write(s + '\n')
-        f.write("c\nUniv Miter\n")
-
-def get_redundant_gates_structural(good_aag, univ_aag, num_gates):
+def is_gate_redundant_naive(good_filepath, faulty_filepath):
     try:
-        Mg, Mf = aiger.load(good_aag), aiger.load(univ_aag)
+        Mg, Mf = aiger.load(good_filepath), aiger.load(faulty_filepath)
         outputs = list(Mg.outputs)
-        combined = Mg['o', {o: f"g_{o}" for o in outputs}] | Mf['o', {o: f"f_{o}" for o in outputs}]
-        
+        Mg = Mg['o', {o: f"g_{o}" for o in outputs}]
+        Mf = Mf['o', {o: f"f_{o}" for o in outputs}]
+        combined = Mg | Mf
         miter_expr = None
         for o in outputs:
             xor_gate = aiger.atom(f"g_{o}") ^ aiger.atom(f"f_{o}")
             miter_expr = xor_gate if miter_expr is None else miter_expr | xor_gate
             
-        base_miter = combined >> miter_expr.aig
-        redundant_indices = []
-        
-        for i in range(num_gates):
-            fault_env = {f"fault_en_{j}": (True if j == i else False) for j in range(num_gates)}
-            collapsed_miter = aiger.source(fault_env) >> base_miter
-            cnf = aiger_cnf.aig2cnf(collapsed_miter)
-            with Solver(name='g4', bootstrap_with=cnf.clauses) as solver:
-                output_lit = cnf.output2lit[list(collapsed_miter.outputs)[0]]
-                if not solver.solve(assumptions=[output_lit]):
-                    redundant_indices.append(i)
-        return redundant_indices
-    except: return []
+        miter = combined >> miter_expr.aig
+        cnf = aiger_cnf.aig2cnf(miter)
+        with Solver(name='g4', bootstrap_with=cnf.clauses) as solver:
+            output_lit = cnf.output2lit[list(miter.outputs)[0]]
+            return not solver.solve(assumptions=[output_lit])
+    except KeyboardInterrupt:
+        raise # FORCE the interrupt to pass through!
+    except Exception as e: 
+        return False
 
 def solve_circuit(circuit_path, output_path):
     start_time = time.time()
@@ -115,32 +83,36 @@ def solve_circuit(circuit_path, output_path):
         return 0, 0, 0, 0, 0, 0, 0.0
 
     M, I, L, O, A, inputs, latches, outputs, gates, symbols = parse_aag_strict(circuit_path)
-    current_aag, univ_aag = output_path + ".temp.aag", output_path + ".univ.aag"
+    current_aag = output_path + ".temp.aag"
     write_aag_strict(current_aag, M, I, L, O, A, inputs, latches, outputs, gates, symbols)
     
     first_in = int(inputs[0])
-    sa0_string = f"{first_in} {first_in + 1}"
+    sa0_string = f"{first_in} {first_in + 1}" # Constant 0 (A AND NOT A)
     circuit_changed, total_removed = True, 0
     
     while circuit_changed:
         circuit_changed = False
         M, I, L, O, A, inputs, latches, outputs, gates, symbols = parse_aag_strict(current_aag)
-        build_universal_faulty_machine(current_aag, univ_aag)
-        redundant_list = get_redundant_gates_structural(current_aag, univ_aag, A)
         
-        for idx in redundant_list:
-            target_lhs = gates[idx].split()[0]
-            if not gates[idx].endswith(sa0_string):
-                gates[idx] = f"{target_lhs} {sa0_string}" 
-                circuit_changed = True; total_removed += 1
+        for i in range(len(gates)):
+            target_lhs = gates[i].split()[0]
+            if gates[i].endswith(sa0_string): continue 
                 
-        if circuit_changed:
-            write_aag_strict(current_aag, M, I, L, O, A, inputs, latches, outputs, gates, symbols)
+            faulty_gates = gates.copy()
+            faulty_gates[i] = f"{target_lhs} {sa0_string}"
+            faulty_aag = "temp_faulty.aag"
+            write_aag_strict(faulty_aag, M, I, L, O, A, inputs, latches, outputs, faulty_gates, symbols)
+            
+            if is_gate_redundant_naive(current_aag, faulty_aag):
+                gates[i] = f"{target_lhs} {sa0_string}" 
+                write_aag_strict(current_aag, M, I, L, O, A, inputs, latches, outputs, gates, symbols)
+                circuit_changed = True; total_removed += 1
+                break 
                 
     subprocess.run(f'{ABC_PATH} -c "read_aiger {current_aag}; strash; write_aiger {output_path}"', 
                    shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if not os.path.exists(output_path): shutil.copy(current_aag, output_path)
-    for f in [current_aag, univ_aag]:
-        if os.path.exists(f): os.remove(f)
         
+    for f in [current_aag, "temp_faulty.aag"]:
+        if os.path.exists(f): os.remove(f)
     return orig_gates, orig_gates, count_reachable_gates(output_path), 0, orig_gates, total_removed, time.time() - start_time

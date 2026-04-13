@@ -10,9 +10,8 @@ ABC_PATH = "./abc/abc"
 
 # --- HELPER FUNCTIONS ---
 def count_reachable_gates(file_path):
-    """Counts reachable AND gates by traversing the AAG structure."""
     try:
-        with open(file_path, 'r', errors='ignore') as f: 
+        with open(file_path, 'r', errors='ignore') as f:
             lines = [l.strip() for l in f if l.strip() and not l.startswith('c')]
         if not lines or not lines[0].startswith('aag'): return 0
         header = lines[0].split()
@@ -47,7 +46,6 @@ def count_reachable_gates(file_path):
     except: return 0
 
 def run_abc_strash(input_path, output_path):
-    """Uses ABC to perform structural hashing (strash) and clean the netlist."""
     if not os.path.exists(ABC_PATH): return False
     cmd = f'{ABC_PATH} -c "read_aiger {input_path}; strash; write_aiger {output_path}"'
     try:
@@ -56,9 +54,9 @@ def run_abc_strash(input_path, output_path):
     except: pass
     return False
 
+# --- ALGORITHM 3: INCREMENTAL ATPG ENGINE ---
 def parse_aag(filepath):
-    """Parses raw AIGER text to extract header, inputs, latches, and gates."""
-    with open(filepath, 'r') as f: 
+    with open(filepath, 'r') as f:
         lines = [l.strip() for l in f.readlines() if l.strip() and not l.startswith('c')]
     header = lines[0]
     parts = header.split()
@@ -70,7 +68,6 @@ def parse_aag(filepath):
     return M, I, L, O, A, inputs, latches, outputs, gates
 
 def write_aag(filepath, M, I, L, O, A, inputs, latches, outputs, gates):
-    """Writes the circuit back to the AIGER format."""
     with open(filepath, 'w') as f:
         f.write(f"aag {M} {I} {L} {O} {A}\n")
         for i in inputs: f.write(str(i) + '\n')
@@ -81,13 +78,14 @@ def write_aag(filepath, M, I, L, O, A, inputs, latches, outputs, gates):
         for idx in range(O): f.write(f"o{idx} o{idx}\n")
         f.write("c\nAutomated Miter\n")
 
-# --- ALGORITHM 2 CORE LOGIC ---
 def build_universal_faulty_machine(current_aag, univ_aag):
-    """Injects an Enable Pin into EVERY gate to create a faulty machine."""
+    """Dynamically rewrites the AAG to inject an Enable Pin into EVERY gate."""
     M, I, L, O, A, inputs, latches, outputs, gates = parse_aag(current_aag)
+    
     new_M = M + 2 * A
     new_I = I + A
     new_A = A * 2
+    
     new_inputs = inputs.copy()
     new_gates = []
     
@@ -104,9 +102,12 @@ def build_universal_faulty_machine(current_aag, univ_aag):
         var_T = M + A + i + 1
         lit_T = var_T * 2
         
-        # 3. Fault logic: O = T AND ~E
+        # 3. Old logic computes T_i
         new_gates.append(f"{lit_T} {r1} {r2}")
-        new_gates.append(f"{lhs} {lit_T} {lit_E + 1}") 
+        
+        # 4. Fault logic computes original lhs: (T_i AND NOT(E_i))
+        # NOT(E_i) is lit_E + 1
+        new_gates.append(f"{lhs} {lit_T} {lit_E + 1}")
         
     with open(univ_aag, 'w') as f:
         f.write(f"aag {new_M} {new_I} {L} {O} {new_A}\n")
@@ -114,13 +115,15 @@ def build_universal_faulty_machine(current_aag, univ_aag):
         for lat in latches: f.write(f"{lat}\n")
         for out in outputs: f.write(f"{out}\n")
         for g in new_gates: f.write(f"{g}\n")
+        
         for idx in range(I): f.write(f"i{idx} i{idx}\n")
+        # EXPOSE THE FAULT PINS TO PY-AIGER VIA THE SYMBOL TABLE
         for idx in range(A): f.write(f"i{I + idx} fault_en_{idx}\n")
         for idx in range(O): f.write(f"o{idx} o{idx}\n")
         f.write("c\nUniversal Faulty Machine\n")
 
-def get_redundant_gates_structural(good_aag, univ_aag, num_gates):
-    """Uses Partial Evaluation to collapse the miter and check for redundancy."""
+def get_redundant_gates_incremental(good_aag, univ_aag, num_gates):
+    """The Incremental SAT Loop. One solver. Zero file I/O inside the loop."""
     try:
         Mg = aiger.load(good_aag)
         Mf = aiger.load(univ_aag)
@@ -128,6 +131,7 @@ def get_redundant_gates_structural(good_aag, univ_aag, num_gates):
         outputs = list(Mg.outputs)
         Mg = Mg['o', {o: f"g_{o}" for o in outputs}]
         Mf = Mf['o', {o: f"f_{o}" for o in outputs}]
+        
         combined = Mg | Mf
         
         miter_expr = None
@@ -136,32 +140,40 @@ def get_redundant_gates_structural(good_aag, univ_aag, num_gates):
             if miter_expr is None: miter_expr = xor_gate
             else: miter_expr = miter_expr | xor_gate
             
-        base_miter = combined >> miter_expr.aig
+        miter = combined >> miter_expr.aig
+        miter_output = list(miter.outputs)[0]
+        
+        cnf = aiger_cnf.aig2cnf(miter)
         redundant_indices = []
         
-        # ONE-SHOT LOOP WITH PARTIAL EVALUATION
-        for i in range(num_gates):
-            # 1. Define fault state (Only ONE fault active)
-            fault_env = {f"fault_en_{j}": (True if j == i else False) for j in range(num_gates)}
+        with Solver(name='g4', bootstrap_with=cnf.clauses) as solver:
+            miter_out_lit = cnf.output2lit[miter_output]
             
-            # 2. Collapse the graph mathematically
-            collapsed_miter = aiger.source(fault_env) >> base_miter
-            miter_output = list(collapsed_miter.outputs)[0]
-            
-            # 3. Generate CNF and boot new solver per query
-            cnf = aiger_cnf.aig2cnf(collapsed_miter)
-            with Solver(name='g4', bootstrap_with=cnf.clauses) as solver:
-                output_lit = cnf.output2lit[miter_output]
-                is_testable = solver.solve(assumptions=[output_lit])
+            # Pre-build assumption array (All faults disabled by default)
+            base_assumptions = [miter_out_lit]
+            en_lits = []
+            for i in range(num_gates):
+                lit = cnf.input2lit[f"fault_en_{i}"]
+                en_lits.append(lit)
+                base_assumptions.append(-lit) 
+                
+            # THE LIGHTNING LOOP
+            for i in range(num_gates):
+                current_assumptions = base_assumptions.copy()
+                # Activate ONLY fault i (Flip negative literal to positive)
+                current_assumptions[i + 1] = en_lits[i] 
+                
+                is_testable = solver.solve(assumptions=current_assumptions)
                 if not is_testable:
                     redundant_indices.append(i)
                     
         return redundant_indices
     except Exception as e:
+        # print(f"SAT Error: {e}")
         return []
 
+# --- THE MASTER INTEGRATION LOOP ---
 def solve_circuit(circuit_path, output_path):
-    """Master loop for Algorithm 2 optimization."""
     start_time = time.time()
     orig_gates = count_reachable_gates(circuit_path)
     
@@ -188,12 +200,17 @@ def solve_circuit(circuit_path, output_path):
         circuit_changed = False
         M, I, L, O, A, inputs, latches, outputs, gates = parse_aag(current_aag)
         
+        # 1. Build Universal Machine
         build_universal_faulty_machine(current_aag, univ_aag)
-        redundant_list = get_redundant_gates_structural(current_aag, univ_aag, A)
         
+        # 2. Run Incremental Sweep
+        redundant_list = get_redundant_gates_incremental(current_aag, univ_aag, A)
+        
+        # 3. Process Results
         for idx in redundant_list:
             target_lhs = gates[idx].split()[0]
             if not gates[idx].endswith(sa0_string):
+                # Physically sever the gate
                 gates[idx] = f"{target_lhs} {sa0_string}" 
                 circuit_changed = True
                 total_removed += 1
@@ -201,6 +218,7 @@ def solve_circuit(circuit_path, output_path):
         if circuit_changed:
             write_aag(current_aag, M, I, L, O, A, inputs, latches, outputs, gates)
                 
+    # Cleanup via ABC
     run_abc_strash(current_aag, output_path)
     if not os.path.exists(output_path): shutil.copy(current_aag, output_path)
         
