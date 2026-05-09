@@ -2,6 +2,7 @@ import aiger
 import aiger_cnf
 from pysat.solvers import Solver
 import time, os, subprocess, shutil
+from abc_utils import run_abc_strash
 
 ABC_PATH = "./abc/abc" 
 
@@ -134,37 +135,72 @@ def solve_circuit(circuit_path, output_path):
                 elif not s.solve(assumptions=base[:A+i] + [f1_lits[i]] + base[A+i+1:] + [miter_lit]):
                     redundant_indices.append((i, 1))
 
+        original_gates_raw = gates_raw.copy()
+
         # Batch Surgery: Apply constants directly to the parsed text matrix
         for idx, val in redundant_indices:
             lhs = gates_raw[idx].split()[0]
             gates_raw[idx] = f"{lhs} {val} {val}"
 
         pre_path = output_path + ".pre.aag"
-        with open(pre_path, 'w') as f:
-            f.write(f"aag {M} {I} {L} {O} {A}\n")
-            for x in inputs + latches + outputs + gates_raw: 
-                f.write(str(x)+'\n')
-                
-            # STRICT SYMBOL FILTERING TO PREVENT ABC CRASH
-            sym_i = [s for s in symbols if s.startswith('i')]
-            sym_l = [s for s in symbols if s.startswith('l')]
-            sym_o = [s for s in symbols if s.startswith('o')]
-            for s in sym_i + sym_l + sym_o: 
-                f.write(s + '\n')
-            f.write("c\nAlg3 Surgery\n")
+        def write_candidate(path, candidate_gates, comment):
+            with open(path, 'w') as f:
+                f.write(f"aag {M} {I} {L} {O} {A}\n")
+                for x in inputs + latches + outputs + candidate_gates:
+                    f.write(str(x)+'\n')
+
+                sym_i = [s for s in symbols if s.startswith('i')]
+                sym_l = [s for s in symbols if s.startswith('l')]
+                sym_o = [s for s in symbols if s.startswith('o')]
+                for s in sym_i + sym_l + sym_o:
+                    f.write(s + '\n')
+                f.write(f"c\n{comment}\n")
+
+        write_candidate(pre_path, gates_raw, "Alg3 SAF Batch Surgery")
         
         # Final topological cleanup using ABC
-        subprocess.run(f'{ABC_PATH} -c "read_aiger {pre_path}; strash; write_aiger {output_path}"', 
-                       shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        run_abc_strash(pre_path, output_path)
         
         # SAFETY NET: If ABC fails, preserve the manually patched file
         if not os.path.exists(output_path):
             shutil.copy(pre_path, output_path)
+
+        from verifier import verify_equivalence
+        status, _ = verify_equivalence(circuit_path, output_path)
+        accepted = redundant_indices
+
+        if status != "PASS" and redundant_indices:
+            accepted = []
+            safe_gates = original_gates_raw.copy()
+            safe_pre_path = output_path + ".safe_pre.aag"
+            safe_out_path = output_path + ".safe_out.aag"
+
+            for idx, val in redundant_indices:
+                trial_gates = safe_gates.copy()
+                lhs = trial_gates[idx].split()[0]
+                trial_gates[idx] = f"{lhs} {val} {val}"
+                write_candidate(safe_pre_path, trial_gates, "Alg3 SAF Verified Trial")
+                run_abc_strash(safe_pre_path, safe_out_path)
+                if os.path.exists(safe_out_path):
+                    trial_status, _ = verify_equivalence(circuit_path, safe_out_path)
+                    if trial_status == "PASS":
+                        safe_gates = trial_gates
+                        accepted.append((idx, val))
+                        shutil.copy(safe_out_path, output_path)
+
+            if not accepted:
+                run_abc_strash(circuit_path, output_path)
+                if not os.path.exists(output_path):
+                    shutil.copy(circuit_path, output_path)
+
+            for f in [safe_pre_path, safe_out_path]:
+                if os.path.exists(f):
+                    os.remove(f)
             
         for f in [univ_aag, pre_path]:
             if os.path.exists(f): os.remove(f)
             
-        return orig_gates, orig_gates, count_reachable_gates(output_path), 0, 0, len(redundant_indices), time.time() - start_time
+        return orig_gates, orig_gates, count_reachable_gates(output_path), 0, 0, len(accepted), time.time() - start_time
     except Exception as e:
         print(f"Algorithm Error: {e}")
         return orig_gates, orig_gates, 0, 0, 0, 0, time.time() - start_time

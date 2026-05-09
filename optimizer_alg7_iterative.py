@@ -2,16 +2,12 @@ import aiger
 import aiger_cnf
 from pysat.solvers import Solver
 import time, os, subprocess, shutil, random
+from abc_utils import run_abc_strash as abc_run_abc_strash
 
 ABC_PATH = "./abc/abc" 
 
 def run_abc_strash(input_path, output_path):
-    if not os.path.exists(ABC_PATH): return False
-    cmd = f'{ABC_PATH} -c "read_aiger {input_path}; strash; write_aiger {output_path}"'
-    try:
-        subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return os.path.exists(output_path)
-    except: return False
+    return abc_run_abc_strash(input_path, output_path)
 
 def count_reachable_gates(file_path):
     try:
@@ -135,6 +131,7 @@ def solve_circuit(circuit_path, output_path):
 
     total_removed = 0
     circuit_changed = True
+    univ_aag = output_path + ".univ.aag"
 
     # 100% ACCURATE ITERATIVE LOOP
     while circuit_changed:
@@ -151,7 +148,6 @@ def solve_circuit(circuit_path, output_path):
         timings["Filter"] += time.time() - t_filt
 
         t_enc = time.time()
-        univ_aag = output_path + ".univ.aag"
         build_universal_machine(work_path, univ_aag)
         
         try:
@@ -182,6 +178,7 @@ def solve_circuit(circuit_path, output_path):
             for i in range(A):
                 if gates_raw[i].endswith(" 0 0") or gates_raw[i].endswith(" 1 1"):
                     continue
+                if i in h_sa0:
                     if s.solve_limited(assumptions=base[:i] + [f0_lits[i]] + base[i+1:] + [miter_lit]) is False:
                         # SEVER ONE GATE AND INSTANTLY RESTART
                         lhs = gates_raw[i].split()[0]

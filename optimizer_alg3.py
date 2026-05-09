@@ -5,6 +5,7 @@ import time
 import os
 import subprocess
 import shutil
+from abc_utils import run_abc_strash as abc_run_abc_strash
 
 ABC_PATH = "./abc/abc" 
 
@@ -46,13 +47,7 @@ def count_reachable_gates(file_path):
     except: return 0
 
 def run_abc_strash(input_path, output_path):
-    if not os.path.exists(ABC_PATH): return False
-    cmd = f'{ABC_PATH} -c "read_aiger {input_path}; strash; write_aiger {output_path}"'
-    try:
-        subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if os.path.exists(output_path): return True
-    except: pass
-    return False
+    return abc_run_abc_strash(input_path, output_path)
 
 # --- ALGORITHM 3: INCREMENTAL ATPG ENGINE ---
 def parse_aag(filepath):

@@ -2,16 +2,12 @@ import aiger
 import aiger_cnf
 from pysat.solvers import Solver
 import time, os, subprocess, shutil, random
+from abc_utils import run_abc_strash as abc_run_abc_strash
 
 ABC_PATH = "./abc/abc" 
 
 def run_abc_strash(input_path, output_path):
-    if not os.path.exists(ABC_PATH): return False
-    cmd = f'{ABC_PATH} -c "read_aiger {input_path}; strash; write_aiger {output_path}"'
-    try:
-        subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return os.path.exists(output_path)
-    except: return False
+    return abc_run_abc_strash(input_path, output_path)
 
 def count_reachable_gates(file_path):
     try:
@@ -211,8 +207,7 @@ def solve_circuit(circuit_path, output_path):
             for s in sym_i + sym_l + sym_o: f.write(s + '\n')
             f.write("c\nAlg3 Surgery\n")
         
-        subprocess.run(f'{ABC_PATH} -c "read_aiger {pre_path}; strash; write_aiger {output_path}"', 
-                       shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        run_abc_strash(pre_path, output_path)
         
         if not os.path.exists(output_path): shutil.copy(pre_path, output_path)
             

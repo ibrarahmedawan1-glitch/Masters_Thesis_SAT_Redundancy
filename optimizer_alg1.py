@@ -2,6 +2,7 @@ import aiger
 import aiger_cnf
 from pysat.solvers import Solver
 import time, os, subprocess, shutil
+from abc_utils import run_abc_strash
 
 ABC_PATH = "./abc/abc" 
 
@@ -109,8 +110,7 @@ def solve_circuit(circuit_path, output_path):
                 circuit_changed = True; total_removed += 1
                 break 
                 
-    subprocess.run(f'{ABC_PATH} -c "read_aiger {current_aag}; strash; write_aiger {output_path}"', 
-                   shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    run_abc_strash(current_aag, output_path)
     if not os.path.exists(output_path): shutil.copy(current_aag, output_path)
         
     for f in [current_aag, "temp_faulty.aag"]:

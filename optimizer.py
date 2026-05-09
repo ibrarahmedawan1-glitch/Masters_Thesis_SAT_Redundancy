@@ -5,6 +5,7 @@ import time
 import os
 import subprocess
 import shutil
+from abc_utils import run_abc_strash as abc_run_abc_strash
 
 ABC_PATH = "./abc/abc" 
 
@@ -47,14 +48,8 @@ def count_reachable_gates(file_path):
     except: return 0
 
 def run_abc_strash(input_path, output_path):
-    """Uses ABC to perform structural hashing (strash) and clean the netlist."""
-    if not os.path.exists(ABC_PATH): return False
-    cmd = f'{ABC_PATH} -c "read_aiger {input_path}; strash; write_aiger {output_path}"'
-    try:
-        subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if os.path.exists(output_path): return True
-    except: pass
-    return False
+    """Uses ABC through binary AIGER to strash and clean the netlist."""
+    return abc_run_abc_strash(input_path, output_path)
 
 def parse_aag(filepath):
     """Parses raw AIGER text to extract header, inputs, latches, and gates."""
