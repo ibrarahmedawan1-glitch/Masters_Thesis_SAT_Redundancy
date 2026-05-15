@@ -148,8 +148,9 @@ def configure_algorithm9_run():
     print(" 1: Fast filtered run (default thesis mode)")
     print(" 2: Exhaustive stuck-at sweep (gate-capped at 50k)")
     print(" 3: Large-circuit filtered survey (allows very-large SAT)")
+    print(" 4: Full exhaustive stuck-at sweep (no gate cap, no SAT time abort)")
     print("="*60)
-    mode = prompt_choice("Select Alg 9 mode (1-3) [1]: ", {"1", "2", "3"}, "1")
+    mode = prompt_choice("Select Alg 9 mode (1-4) [1]: ", {"1", "2", "3", "4"}, "1")
 
     if mode == "2":
         RUN_MODE_LABEL = "alg9_exhaustive_cap50k"
@@ -165,6 +166,17 @@ def configure_algorithm9_run():
         set_int("ALG9_MAX_CANDIDATES", 3000)
         set_int("ALG9_LARGE_MAX_CANDIDATES", 100)
         set_int("ALG9_MAX_SAT_SECONDS", 60)
+        MAX_DATASET_GATES = 0
+    elif mode == "4":
+        RUN_MODE_LABEL = "alg9_exhaustive_full"
+        set_flag("ALG9_EXHAUSTIVE", True)
+        set_flag("ALG9_ALLOW_VERY_LARGE_SAT", True)
+        set_int("ALG9_MAX_CANDIDATES", 0)
+        set_int("ALG9_MAX_SAT_SECONDS", 0)
+        set_int("ALG9_MAX_CONSEC_TIMEOUTS", 0)
+        set_int("ALG9_MIN_CHECKS_TIMEOUT_RATE", 0)
+        set_int("ALG9_REBUILD_AFTER_COMMITS", 1000000000)
+        set_int("ALG9_MAX_PASSES", 20)
         MAX_DATASET_GATES = 0
     else:
         RUN_MODE_LABEL = "alg9_fast_filtered"
@@ -263,6 +275,123 @@ def configure_algorithm9_run():
         print(f"    Custom circuit path: {CUSTOM_CIRCUIT_PATH}")
     print(f"    Planted-live plants/base: {PLANTED_LIVE_PER_BASE}")
 
+def configure_algorithm10_run():
+    """Collect Algorithm 10 mode/profile before importing the module."""
+    global INCLUDE_BENCHMARK_SUITES, INCLUDE_ISCAS_BENCHMARKS, INCLUDE_CUSTOM_CIRCUITS
+    global MAX_DATASET_GATES, INCLUDE_SYNTHETIC_FUZZ
+    global INCLUDE_PLANTED_LIVE, ONLY_PLANTED_LIVE, PLANTED_LIVE_PER_BASE
+    global RUN_MODE_LABEL, DATASET_PROFILE_LABEL, CUSTOM_CIRCUIT_PATH
+
+    print("\n" + "="*60)
+    print("   ALG 10 CHECKPOINTED SAT MODE")
+    print("="*60)
+    print(" 1: Fast save/checkpoint mode (bounded per circuit)")
+    print(" 2: Deep resume mode (larger budgets, longer per circuit)")
+    print("="*60)
+    mode = prompt_choice("Select Alg 10 mode (1-2) [1]: ", {"1", "2"}, "1")
+
+    if mode == "2":
+        RUN_MODE_LABEL = "alg10_deep_resume"
+        os.environ["ALG10_MODE"] = "deep_resume"
+        os.environ.setdefault("ALG10_BUDGETS", "1000,5000,20000,100000")
+        os.environ.setdefault("ALG10_MAX_CIRCUIT_SECONDS", "600")
+        set_int("ALG10_REBUILD_AFTER_COMMITS", 100)
+    else:
+        RUN_MODE_LABEL = "alg10_fast_save"
+        os.environ["ALG10_MODE"] = "fast_save"
+        os.environ.setdefault("ALG10_BUDGETS", "100,1000,5000")
+        os.environ.setdefault("ALG10_MAX_CIRCUIT_SECONDS", "60")
+        set_int("ALG10_REBUILD_AFTER_COMMITS", 100)
+
+    MAX_DATASET_GATES = 0
+    set_int("MAX_DATASET_GATES", MAX_DATASET_GATES)
+    os.environ["RUN_MODE_LABEL"] = RUN_MODE_LABEL
+
+    print("\n" + "="*60)
+    print("   DATASET PROFILE")
+    print("="*60)
+    print(" 1: Full mixed run (fuzz + ISCAS + EPFL/prepared + planted-live)")
+    print(" 2: Planted-live only (quick ATPG sanity check)")
+    print(" 3: Real suites + planted-live (ISCAS + EPFL/prepared, no fuzz)")
+    print(" 4: Fuzz + planted-live only (synthetic AIGER fuzz, no real suites)")
+    print(" 5: Custom circuit(s) only (.aag/.aig file or folder)")
+    print("="*60)
+    profile = prompt_choice("Select dataset profile (1-5) [5]: ", {"1", "2", "3", "4", "5"}, "5")
+
+    if profile == "1":
+        DATASET_PROFILE_LABEL = "full_mixed"
+        INCLUDE_SYNTHETIC_FUZZ = True
+        INCLUDE_ISCAS_BENCHMARKS = True
+        INCLUDE_BENCHMARK_SUITES = True
+        INCLUDE_CUSTOM_CIRCUITS = False
+        INCLUDE_PLANTED_LIVE = True
+        ONLY_PLANTED_LIVE = False
+    elif profile == "2":
+        DATASET_PROFILE_LABEL = "planted_live_only"
+        INCLUDE_SYNTHETIC_FUZZ = False
+        INCLUDE_ISCAS_BENCHMARKS = False
+        INCLUDE_BENCHMARK_SUITES = False
+        INCLUDE_CUSTOM_CIRCUITS = False
+        INCLUDE_PLANTED_LIVE = True
+        ONLY_PLANTED_LIVE = True
+    elif profile == "3":
+        DATASET_PROFILE_LABEL = "real_suites_planted"
+        INCLUDE_SYNTHETIC_FUZZ = False
+        INCLUDE_ISCAS_BENCHMARKS = True
+        INCLUDE_BENCHMARK_SUITES = True
+        INCLUDE_CUSTOM_CIRCUITS = False
+        INCLUDE_PLANTED_LIVE = True
+        ONLY_PLANTED_LIVE = False
+    elif profile == "4":
+        DATASET_PROFILE_LABEL = "fuzz_planted"
+        INCLUDE_SYNTHETIC_FUZZ = True
+        INCLUDE_ISCAS_BENCHMARKS = False
+        INCLUDE_BENCHMARK_SUITES = False
+        INCLUDE_CUSTOM_CIRCUITS = False
+        INCLUDE_PLANTED_LIVE = True
+        ONLY_PLANTED_LIVE = False
+    else:
+        DATASET_PROFILE_LABEL = "custom_only"
+        INCLUDE_SYNTHETIC_FUZZ = False
+        INCLUDE_ISCAS_BENCHMARKS = False
+        INCLUDE_BENCHMARK_SUITES = False
+        INCLUDE_CUSTOM_CIRCUITS = True
+        INCLUDE_PLANTED_LIVE = False
+        ONLY_PLANTED_LIVE = False
+        try:
+            raw = input(f"Custom file/folder path [{CUSTOM_CIRCUIT_PATH}]: ").strip()
+            if raw:
+                CUSTOM_CIRCUIT_PATH = raw
+        except EOFError:
+            pass
+
+    if INCLUDE_PLANTED_LIVE:
+        try:
+            raw = input(f"Plants per base for planted-live circuits [{PLANTED_LIVE_PER_BASE}]: ").strip()
+            if raw:
+                PLANTED_LIVE_PER_BASE = max(0, int(raw))
+        except (EOFError, ValueError):
+            print(f"Keeping planted-live count at {PLANTED_LIVE_PER_BASE}.")
+
+    set_flag("INCLUDE_SYNTHETIC_FUZZ", INCLUDE_SYNTHETIC_FUZZ)
+    set_flag("INCLUDE_ISCAS_BENCHMARKS", INCLUDE_ISCAS_BENCHMARKS)
+    set_flag("INCLUDE_BENCHMARK_SUITES", INCLUDE_BENCHMARK_SUITES)
+    set_flag("INCLUDE_CUSTOM_CIRCUITS", INCLUDE_CUSTOM_CIRCUITS)
+    set_flag("INCLUDE_PLANTED_LIVE", INCLUDE_PLANTED_LIVE)
+    set_flag("ONLY_PLANTED_LIVE", ONLY_PLANTED_LIVE)
+    set_int("PLANTED_LIVE_PER_BASE", PLANTED_LIVE_PER_BASE)
+    os.environ["DATASET_PROFILE_LABEL"] = DATASET_PROFILE_LABEL
+    os.environ["CUSTOM_CIRCUIT_PATH"] = CUSTOM_CIRCUIT_PATH
+
+    print("\n[Alg 10 config]")
+    print(f"    Mode: {RUN_MODE_LABEL}")
+    print(f"    Dataset profile: {DATASET_PROFILE_LABEL}")
+    print(f"    Budgets: {os.environ.get('ALG10_BUDGETS')}")
+    print(f"    Max circuit seconds: {os.environ.get('ALG10_MAX_CIRCUIT_SECONDS')}")
+    print(f"    Checkpoint dir: {os.environ.get('ALG10_CHECKPOINT_DIR', 'results_optimized/alg10_checkpoints')}")
+    if INCLUDE_CUSTOM_CIRCUITS:
+        print(f"    Custom circuit path: {CUSTOM_CIRCUIT_PATH}")
+
 def select_optimizer():
     """Interactive menu to route to the correct algorithm file."""
     print("\n" + "="*60)
@@ -277,6 +406,7 @@ def select_optimizer():
     print(" 7: Alg 7 - Sim Filter + Iterative Surgery (100% Accurate)")
     print(" 8: Alg 8 - Pure Python Hybrid Engine + ABC CEC Verification")
     print(" 9: Alg 9 - Committed In-Memory Incremental SAT")
+    print("10: Alg10 - Checkpointed Budget-Cycling Global SAT")
     print("="*60)
 
     mapping = {
@@ -288,10 +418,11 @@ def select_optimizer():
         "6": "optimizer_alg3_timeout_cadical",
         "7": "optimizer_alg7_iterative",
         "8": "optimizer_alg8_hybrid",
-        "9": "optimizer_alg9_incremental"
+        "9": "optimizer_alg9_incremental",
+        "10": "optimizer_alg10_tiered"
     }
 
-    choice = prompt_choice("Enter choice (1-9): ", set(mapping), "8")
+    choice = prompt_choice("Enter choice (1-10): ", set(mapping), "9")
     return mapping[choice], choice
 
 if __name__ == "__main__":
@@ -302,6 +433,8 @@ if __name__ == "__main__":
     algo_module_name, algo_id = select_optimizer()
     if algo_id == "9":
         configure_algorithm9_run()
+    elif algo_id == "10":
+        configure_algorithm10_run()
 
     print(f"\n[+] Loading Engine: {algo_module_name}.py")
     
@@ -309,8 +442,8 @@ if __name__ == "__main__":
     optimizer = importlib.import_module(algo_module_name)
     
     report_tag = f"ALG{algo_id}"
-    if algo_id == "9":
-        report_tag = f"ALG9_{RUN_MODE_LABEL}_{DATASET_PROFILE_LABEL}"
+    if algo_id in {"9", "10"}:
+        report_tag = f"ALG{algo_id}_{RUN_MODE_LABEL}_{DATASET_PROFILE_LABEL}"
     REPORT_FILE = os.path.join(RESULTS_BASE_DIR, f"thesis_results_{report_tag}_{timestamp}.csv")
 
     print(f"\n--- THESIS PIPELINE STARTED [{timestamp}] ---")
@@ -399,7 +532,7 @@ if __name__ == "__main__":
                     "0", "0", "0", "0", "0", "0",
                     0, 0, 0, 0, 0, "SKIPPED_GATE_LIMIT",
                     input_metrics["Area_AND2"], input_metrics["Area_AND2"], input_metrics["Area_AND2"],
-                    0, 0, 0, 0, 0, "SKIPPED_GATE_LIMIT"
+                    0, 0, 0, 0, 0, "", "", "", "", "", "", "", "", "", "", "", "SKIPPED_GATE_LIMIT"
                 ])
                 continue
         except Exception:
@@ -408,7 +541,7 @@ if __name__ == "__main__":
         print(f"    Processing {name:<25}...", end=" ", flush=True)
         try:
             # Handle the different return signatures dynamically
-            if algo_id in ["5", "7", "8", "9"]:
+            if algo_id in ["5", "7", "8", "9", "10"]:
                 orig, _, final, removed, timings = optimizer.solve_circuit(f_path, opt_path)
             else:
                 orig, _, final, _, _, removed, dur = optimizer.solve_circuit(f_path, opt_path)
@@ -451,6 +584,13 @@ if __name__ == "__main__":
                 timings.get("SAT_Induced_Removed_AND2", ""),
                 timings.get("SAT_Accepted_SA0", ""), timings.get("SAT_Accepted_SA1", ""),
                 timings.get("Rebuilds", ""),
+                timings.get("SAT_Unresolved", ""), timings.get("SAT_Max_Budget", ""),
+                timings.get("Checkpoint_Resume", ""),
+                timings.get("TFI_Checks", ""), timings.get("TFI_Query_SAT", ""),
+                timings.get("TFI_Query_UNSAT", ""), timings.get("TFI_Timeouts", ""),
+                timings.get("TFI_Skipped", ""),
+                timings.get("Global_Checks", ""), timings.get("Global_Query_SAT", ""),
+                timings.get("Global_Query_UNSAT", ""), timings.get("Global_Timeouts", ""),
                 status
             ])
             
@@ -461,7 +601,8 @@ if __name__ == "__main__":
                 0, 0, 0, "SKIPPED",
                 0, 0, 0, "SKIPPED", 0, 0, "SKIPPED",
                 "0", "0", "0", "0", "0", "0",
-                "", "", "", "", "", "", "", "", "", "", "", "", "", "", "SKIPPED"
+                "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+                "", "", "", "", "", "", "", "", "", "SKIPPED"
             ])
             continue
         except Exception as e:
@@ -471,7 +612,8 @@ if __name__ == "__main__":
                 0, 0, 0, "ERR",
                 0, 0, 0, "ERR", 0, 0, "ERR",
                 "0", "0", "0", "0", "0", "0",
-                "", "", "", "", "", "", "", "", "", "", "", "", "", "", "ERROR"
+                "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+                "", "", "", "", "", "", "", "", "", "ERROR"
             ])
 
     with open(REPORT_FILE, "w", newline="") as f:
@@ -486,7 +628,11 @@ if __name__ == "__main__":
             "SAT_Abort_Reason",
             "Initial_AND2", "After_Structural_AND2", "After_SAT_AND2",
             "Structural_Removed_AND2", "SAT_Induced_Removed_AND2",
-            "SAT_Accepted_SA0", "SAT_Accepted_SA1", "Rebuilds", "Verify"
+            "SAT_Accepted_SA0", "SAT_Accepted_SA1", "Rebuilds",
+            "SAT_Unresolved", "SAT_Max_Budget", "Checkpoint_Resume",
+            "TFI_Checks", "TFI_Query_SAT", "TFI_Query_UNSAT", "TFI_Timeouts", "TFI_Skipped",
+            "Global_Checks", "Global_Query_SAT", "Global_Query_UNSAT", "Global_Timeouts",
+            "Verify"
         ])
         writer.writerows(stats)
 

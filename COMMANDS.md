@@ -28,13 +28,42 @@ python3 main.py
 Recommended first algorithm choice for the current pipeline is `9`, the committed in-memory incremental SAT optimizer.
 After selecting `9`, choose a runtime mode and dataset profile from the prompts.
 
+Algorithm 9 runtime modes:
+
+- `1`: fast filtered thesis mode.
+- `2`: exhaustive stuck-at sweep capped at 50k gates per circuit.
+- `3`: filtered large-circuit survey with very-large SAT enabled.
+- `4`: full exhaustive stuck-at sweep with no dataset gate cap and no SAT wall-clock abort.
+
+Algorithm 10 is the checkpointed budget-cycling SAT engine. It has two modes:
+
+- `1`: fast save/checkpoint mode with bounded per-circuit runtime.
+- `2`: deep resume mode with larger budgets and a longer per-circuit runtime.
+
+Useful non-interactive Algorithm 10 knobs:
+
+```bash
+ALG10_MODE=fast_save ALG10_MAX_CIRCUIT_SECONDS=60 ALG10_BUDGETS=100,1000,5000 python3 main.py
+ALG10_MODE=deep_resume ALG10_MAX_CIRCUIT_SECONDS=600 ALG10_BUDGETS=1000,5000,20000,100000 python3 main.py
+```
+
+Checkpoints are written under `results_optimized/alg10_checkpoints/` by default. Set `ALG10_CHECKPOINT_DIR=/path/to/dir` to choose another directory, and `ALG10_RESET_CHECKPOINT=1` to ignore an existing checkpoint.
+
+Algorithm 10 also has a sound TFI constancy tier before the global miter:
+
+```bash
+ALG10_TFI_CONSTANCY=1 ALG10_TFI_BUDGET=500 ALG10_TFI_MAX_CONE_GATES=2000 python3 main.py
+```
+
+TFI `UNSAT` can commit a stuck-at constant safely. TFI `SAT`, timeout, or skip still escalates to the global miter, so the tier does not remove candidates from coverage.
+
 The full run generates synthetic circuits, copies `.aag` files from `benchmarks/`, optimizes every dataset circuit, verifies each output, and writes a CSV report to:
 
 ```text
 results_optimized/thesis_results_ALG<id>_<timestamp>.csv
 ```
 
-Algorithm 9 reports include the selected mode and profile in both the filename and CSV columns.
+Algorithm 9 and Algorithm 10 reports include the selected mode and profile in both the filename and CSV columns.
 
 ## Plotting
 
@@ -72,9 +101,18 @@ python3 test_miter_integrity.py
 python3 test_strict_pipeline.py
 python3 test_alg3_sandbox.py
 python3 test_encoding_surgery.py
+python3 test_alg9_random_observability.py
+python3 test_alg10_checkpoint.py
+python3 test_algorithms_1_to_10.py
 ```
 
 These files are script-style checks with `if __name__ == "__main__"` blocks, not a fully standardized pytest suite.
+
+Force Algorithm 9's random-observability filter during the focused comparison smoke:
+
+```bash
+ALG9_FAULT_SIM_MAX_GATES=0 ALG9_RANDOM_OBS_SIM=1 python3 test_incremental_sat_pipeline.py --epfl
+```
 
 ## ABC Checks
 

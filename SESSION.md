@@ -35,8 +35,9 @@ python3 main.py
 | 7 | `optimizer_alg7_iterative.py` | Simulation filter plus iterative surgery |
 | 8 | `optimizer_alg8_hybrid.py` | Pure Python hybrid optimizer with ABC CEC verification |
 | 9 | `optimizer_alg9_incremental.py` | Committed in-memory incremental SAT optimizer |
+| 10 | `optimizer_alg10_tiered.py` | Checkpointed budget-cycling global SAT optimizer |
 
-The menu has been corrected to accept choices `1-9`. Choice `7` maps to `optimizer_alg7_iterative.py`, choice `8` maps to `optimizer_alg8_hybrid.py`, and choice `9` maps to `optimizer_alg9_incremental.py`.
+The menu has been corrected to accept choices `1-10`. Choice `7` maps to `optimizer_alg7_iterative.py`, choice `8` maps to `optimizer_alg8_hybrid.py`, choice `9` maps to `optimizer_alg9_incremental.py`, and choice `10` maps to `optimizer_alg10_tiered.py`.
 
 ## Current Debugging State
 
@@ -131,6 +132,7 @@ After selecting option `9` in `main.py`, the pipeline now asks for an Algorithm 
 - `1` fast filtered run: default thesis mode; filtered candidates, standard large-circuit guards, no SAT on very-large circuits.
 - `2` exhaustive stuck-at sweep: sets `ALG9_EXHAUSTIVE=1` and caps the dataset at 50k gates with `MAX_DATASET_GATES=50000` to avoid huge EPFL outliers.
 - `3` large-circuit filtered survey: keeps filtering enabled, sets `ALG9_ALLOW_VERY_LARGE_SAT=1`, and uses conservative large-circuit candidate/time budgets.
+- `4` full exhaustive stuck-at sweep: sets `ALG9_EXHAUSTIVE=1`, removes the dataset gate cap, disables the per-circuit SAT wall-clock abort, disables adaptive timeout aborts, and checks SA0/SA1 candidates across all included circuits. This can take a very long time on large EPFL/external circuits.
 
 It then asks for a dataset profile:
 
@@ -166,10 +168,17 @@ Exhaustive Algorithm 9 without the huge EPFL arithmetic outliers:
 MAX_DATASET_GATES=50000 ALG9_EXHAUSTIVE=1 python3 main.py
 ```
 
+Full exhaustive Algorithm 9 with no dataset gate cap and no SAT wall-clock abort:
+
+```bash
+ALG9_EXHAUSTIVE=1 ALG9_ALLOW_VERY_LARGE_SAT=1 ALG9_MAX_CANDIDATES=0 ALG9_MAX_SAT_SECONDS=0 ALG9_MAX_CONSEC_TIMEOUTS=0 ALG9_MIN_CHECKS_TIMEOUT_RATE=0 python3 main.py
+```
+
 Useful Algorithm 9 knobs:
 
 - `ALG9_EXHAUSTIVE`: default `0`; set `1` to test both SA0/SA1 for every gate.
 - `ALG9_FAULT_SIM_MAX_GATES`: default `2000`; circuits up to this size use stronger fault simulation filtering.
+- `ALG9_RANDOM_OBS_SIM`: default `1`; above the exact fault-simulation threshold, use deterministic random-pattern observability to nominate ODC-like stuck-at candidates for SAT. Set `0` to fall back to the older constant-signature filter.
 - `ALG9_MAX_CANDIDATES`: default `2000`; filtered candidate cap for normal circuits.
 - `ALG9_LARGE_GATE_LIMIT`: default `10000`; threshold for lower SAT budget and smaller candidate cap.
 - `ALG9_LARGE_MAX_CANDIDATES`: default `100`.
@@ -179,6 +188,17 @@ Useful Algorithm 9 knobs:
 - `ALG9_MAX_CONSEC_TIMEOUTS`: default `20`; aborts the SAT phase after this many consecutive limited SAT calls return unknown.
 - `ALG9_MIN_CHECKS_TIMEOUT_RATE`: default `50`; minimum SAT checks before timeout-rate abort can trigger.
 - `ALG9_MAX_TIMEOUT_RATE`: default `0.80`; aborts the SAT phase when timeout rate is too high after the minimum check count.
+
+Algorithm 10 checkpoint/budget knobs:
+
+- `ALG10_MODE`: `fast_save` or `deep_resume`; controls default budgets and per-circuit time.
+- `ALG10_BUDGETS`: comma-separated increasing conflict budgets, for example `100,1000,5000`.
+- `ALG10_MAX_CIRCUIT_SECONDS`: per-circuit wall-clock budget. On expiry, Algorithm 10 writes the latest safe AAG and checkpoint, then returns so `main.py` can verify and move to the next circuit.
+- `ALG10_CHECKPOINT_DIR`: default `results_optimized/alg10_checkpoints`; stores `<circuit>.json` and `<circuit>.work.aag`.
+- `ALG10_RESET_CHECKPOINT`: set `1` to ignore a previous checkpoint and restart from the current input.
+- `ALG10_TFI_CONSTANCY`: default `1`; try a sound TFI constancy SAT proof before the global miter.
+- `ALG10_TFI_BUDGET`: default `500` in fast-save and `2000` in deep-resume.
+- `ALG10_TFI_MAX_CONE_GATES`: default `2000` in fast-save and `10000` in deep-resume; larger cones skip TFI and go to global SAT.
 
 Planted-live benchmark knobs:
 
@@ -304,3 +324,98 @@ Near-term thesis plan:
 - Use full mixed and real-suite profiles for final evaluation tables.
 - Use custom profile `5` for any new circuits from the professor.
 - Stop changing core Algorithm 9 soon; focus next on final benchmark matrix, plots, chapter writing, and presentation preparation.
+
+## 2026-05-15 Random Simulation Checkpoint
+
+Added Algorithm 9 random-observability candidate filtering for circuits above the exact fault-simulation threshold. This is not a proof step: simulation only nominates candidates, incremental SAT still proves each accepted stuck-at replacement, and final ABC CEC remains mandatory for reported results.
+
+New/updated files:
+
+- `optimizer_alg9_incremental.py`: added `ALG9_RANDOM_OBS_SIM`, deterministic primary signatures, and a linear-time random observability pass for large-circuit candidate nomination.
+- `test_alg9_random_observability.py`: focused smoke where signature-only filtering misses `out = x OR (x AND y)`, while random observability nominates the ODC stuck-at-0 candidate and SAT proves it.
+
+Smoke checks:
+
+- `venv/bin/python -m py_compile optimizer_alg9_incremental.py test_alg9_random_observability.py`
+- `venv/bin/python test_alg9_random_observability.py`: signature-only `2 -> 2`, random-observability `2 -> 0`, CEC `PASS`.
+- `venv/bin/python test_incremental_sat_pipeline.py`: ODC, `c17`, and `c432` all CEC `PASS`.
+- `ALG9_FAULT_SIM_MAX_GATES=0 ALG9_RANDOM_OBS_SIM=1 venv/bin/python test_incremental_sat_pipeline.py --epfl`: forced observability path on ODC/ISCAS/EPFL smoke, all CEC `PASS`.
+- Capped large-circuit spot check on `benchmark_suites/epfl/epfl_arithmetic_sqrt.aag`: `24618 -> 24618`, abort reason `CONSECUTIVE_TIMEOUTS` under tight smoke budget, CEC `PASS`.
+
+## 2026-05-15 Algorithm 10 Checkpointed SAT
+
+Added `optimizer_alg10_tiered.py` and wired it into `main.py` as option `10`. Algorithm 10 is intentionally conservative: it does not use simulation or local windows as acceptance proofs. It checks all SA0/SA1 candidates through the global Algorithm-9-style miter, cycling through increasing conflict budgets and saving the latest safe optimized AAG when a per-circuit time limit or user interrupt occurs.
+
+Implemented behavior:
+
+- Fast-save mode: bounded per-circuit run, writes checkpoint and latest safe `.aag`, then returns to `main.py` for final CEC and the next circuit.
+- Deep-resume mode: loads the checkpoint work AAG for the same dataset path/hash and retries with larger budgets.
+- Checkpoint files: JSON telemetry plus `.work.aag`; live solver state is not serialized.
+- Correctness boundary: every accepted stuck-at replacement is global-SAT UNSAT under the currently committed replacements; final ABC CEC is still required.
+
+Smoke checks:
+
+- `venv/bin/python test_alg10_checkpoint.py`: ODC `2 -> 0` CEC `PASS`; forced c432 checkpoint `125 -> 125` CEC `PASS`; deep-resume c432 `125 -> 121` CEC `PASS`.
+- `venv/bin/python test_algorithms_1_to_10.py`: algorithms `1-10` on `c17`, all CEC `PASS`; algorithms `8-10` on `c432`, all CEC `PASS`.
+- `main.py` Algorithm 10 custom `benchmarks/c432.aag`, fast-save with `ALG10_MAX_CIRCUIT_SECONDS=0.001`: row reports `TIME_BUDGET_CHECKPOINT`, `125 -> 125`, CEC `PASS`.
+- `main.py` Algorithm 10 custom `benchmarks/c432.aag`, deep-resume from the same checkpoint: row reports `125 -> 121`, CEC `PASS`.
+
+## 2026-05-15 Algorithm 10 TFI Tier
+
+Added a sound TFI constancy tier to Algorithm 10. For a candidate stuck-at value, it encodes only the complete transitive fanin of the target gate and asks whether the opposite gate value is reachable. If the local SAT instance is `UNSAT`, the gate is functionally constant and the stuck-at replacement is safe. If it is `SAT`, times out, or is skipped due to cone size, the candidate still escalates to the existing global miter path.
+
+Telemetry added to new CSVs:
+
+- `TFI_Checks`, `TFI_Query_SAT`, `TFI_Query_UNSAT`, `TFI_Timeouts`, `TFI_Skipped`
+- `Global_Checks`, `Global_Query_SAT`, `Global_Query_UNSAT`, `Global_Timeouts`
+
+Smoke checks:
+
+- `venv/bin/python test_alg10_checkpoint.py`: ODC case still accepted by global miter; TFI-constant case `3 -> 0` accepted by `TFI_Query_UNSAT=1`; checkpoint/resume c432 still CEC `PASS`.
+- `venv/bin/python test_algorithms_1_to_10.py`: algorithms `1-10` on `c17`, all CEC `PASS`; algorithms `8-10` on `c432`, all CEC `PASS`.
+- `main.py` Algorithm 10 custom `benchmarks/c432.aag`: `125 -> 121`, CEC `PASS`, CSV includes TFI/global split.
+- 5-second EPFL `sqrt` smoke with TFI enabled: `24618 -> 24618`, `TFI_Checks=1642`, no TFI UNSAT, checkpointed by time budget, CEC `PASS`.
+
+## 2026-05-15 End-of-Day Checkpoint
+
+Today added and verified the current Algorithm 10 direction:
+
+- `optimizer_alg10_tiered.py`: checkpointed budget-cycling global SAT engine.
+- Algorithm 10 fast-save mode: bounded per-circuit runtime, latest safe `.aag`, checkpoint JSON/work AAG, then return to `main.py`.
+- Algorithm 10 deep-resume mode: resumes checkpoint work AAG and retries with larger budgets.
+- Algorithm 10 TFI constancy tier: sound local SAT proof before global miter. TFI `UNSAT` can commit; TFI `SAT`, timeout, or skip still escalates globally, so candidate coverage is not reduced.
+- Algorithm 9 random-observability candidate nomination is present and documented; SAT remains the proof step.
+- `main.py`: menu now includes Algorithm 10 and CSV telemetry for checkpoint/TFi/global split.
+- `Readme.md`, `COMMANDS.md`, and `custom_circuits/README.md` updated for the current pipeline.
+
+Latest important reports:
+
+- Fast full mixed Algorithm 10 survey: `results_optimized/thesis_results_ALG10_alg10_fast_save_full_mixed_2026-05-15_19-06-11.csv`.
+  - 240/240 `PASS`.
+  - 226 complete, 14 `TIME_BUDGET_CHECKPOINT`.
+  - Total saved: 165,902 AND2 nodes.
+- Deep real-suites + planted-live resume: `results_optimized/thesis_results_ALG10_alg10_deep_resume_real_suites_planted_2026-05-15_19-32-25.csv`.
+  - 38/38 `PASS`.
+  - Same 62 AND2 saved as fast mode on the overlapping circuits.
+  - Better coverage than fast mode but no new reductions in that run.
+
+Interpretation:
+
+- Algorithm 10 checkpointing works and is safe.
+- Deep global SAT alone is not enough for hard EPFL arithmetic circuits such as `div`, `hyp`, `sqrt`, and `multiplier`; it spends time but found no new UNSAT reductions in the latest deep run.
+- The TFI tier is sound and useful for local constants, but the quick EPFL `sqrt` smoke found no TFI UNSAT. Next improvement should likely be exact affected-output cone miter or stronger candidate ordering, not blind longer global runs.
+
+Useful checks already run after today's edits:
+
+- `venv/bin/python -m py_compile main.py optimizer_alg10_tiered.py optimizer_alg9_incremental.py test_alg10_checkpoint.py test_algorithms_1_to_10.py test_alg9_random_observability.py`
+- `venv/bin/python test_alg10_checkpoint.py`
+- `venv/bin/python test_algorithms_1_to_10.py`
+- `venv/bin/python test_alg9_random_observability.py`
+- `main.py` Algorithm 10 custom `benchmarks/c432.aag`: `125 -> 121`, CEC `PASS`.
+
+Tomorrow's recommended next step:
+
+1. Do not spend another overnight run on plain global SAT for EPFL arithmetic yet.
+2. Implement exact affected-output cone miter as the next sound middle tier.
+3. Keep Algorithm 10's checkpoint/resume wrapper as the orchestration shell.
+4. Add telemetry separating inherited checkpoint reductions from newly found reductions in the current run.

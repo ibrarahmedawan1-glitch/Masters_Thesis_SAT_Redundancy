@@ -37,6 +37,7 @@ EXHAUSTIVE_CHECK = os.environ.get("ALG9_EXHAUSTIVE", "0") != "0"
 FAULT_SIM_MAX_GATES = int(os.environ.get("ALG9_FAULT_SIM_MAX_GATES", "2000"))
 SIGNATURE_BITS = int(os.environ.get("ALG9_SIGNATURE_BITS", "2048"))
 SIGNATURE_BIAS = float(os.environ.get("ALG9_SIGNATURE_BIAS", "0.0"))
+RANDOM_OBS_SIM = os.environ.get("ALG9_RANDOM_OBS_SIM", "1") != "0"
 REBUILD_ROUNDS = int(os.environ.get("ALG9_REBUILD_ROUNDS", "4"))
 REBUILD_AFTER_COMMITS = int(os.environ.get("ALG9_REBUILD_AFTER_COMMITS", "100"))
 MAX_CANDIDATES = int(os.environ.get("ALG9_MAX_CANDIDATES", "2000"))
@@ -78,11 +79,9 @@ def _candidate_values(idx, sim_sa0, sim_sa1):
     return values
 
 
-def _signature_candidates(inputs, latches, gates_raw):
-    """Linear-time random-signature filter for likely stuck-at candidates."""
-    bits = max(64, SIGNATURE_BITS)
+def _primary_signatures(inputs, latches, bits, seed_value):
     mask = (1 << bits) - 1
-    rng = random.Random(0xA19E9)
+    rng = random.Random(seed_value)
     values = {0: 0, 1: mask}
 
     primary_lits = list(inputs)
@@ -92,6 +91,14 @@ def _signature_candidates(inputs, latches, gates_raw):
         base = lit & ~1
         values[base] = val
         values[base ^ 1] = (~val) & mask
+
+    return values, mask
+
+
+def _signature_candidates(inputs, latches, gates_raw):
+    """Linear-time random-signature filter for likely stuck-at candidates."""
+    bits = max(64, SIGNATURE_BITS)
+    values, mask = _primary_signatures(inputs, latches, bits, 0xA19E9)
 
     candidate_map = {}
     low_limit = int(bits * SIGNATURE_BIAS)
@@ -120,6 +127,65 @@ def _signature_candidates(inputs, latches, gates_raw):
     return candidate_map
 
 
+def _random_observability_candidates(inputs, latches, outputs, gates_raw):
+    """
+    Linear-time random-pattern observability filter for stuck-at candidates.
+
+    A stuck-at-0 candidate needs at least one sampled pattern where the gate is
+    1 and a toggle at that gate can reach a sweep root. Stuck-at-1 is symmetric.
+    Candidates that do not meet that random detectability condition still go to
+    SAT, so this stage only proposes work; it never proves a replacement.
+    """
+    bits = max(64, SIGNATURE_BITS)
+    values, mask = _primary_signatures(inputs, latches, bits, 0x0B5E12AB1E)
+
+    for lhs, r0, r1 in gates_raw:
+        val = values.get(r0, 0) & values.get(r1, 0)
+        values[lhs] = val
+        values[lhs ^ 1] = (~val) & mask
+
+    observability = {}
+    for root in outputs:
+        if root > 1:
+            base = root & ~1
+            observability[base] = observability.get(base, 0) | mask
+
+    for lhs, r0, r1 in reversed(gates_raw):
+        obs = observability.get(lhs, 0)
+        if not obs:
+            continue
+
+        if r0 > 1:
+            base0 = r0 & ~1
+            observability[base0] = observability.get(base0, 0) | (obs & values.get(r1, 0))
+        if r1 > 1:
+            base1 = r1 & ~1
+            observability[base1] = observability.get(base1, 0) | (obs & values.get(r0, 0))
+
+    scored = []
+    for idx, (lhs, _, _) in enumerate(gates_raw):
+        val = values.get(lhs, 0)
+        obs = observability.get(lhs, 0)
+        ones = val.bit_count()
+        zeros = bits - ones
+        stuck_values = []
+
+        if (val & obs) == 0:
+            stuck_values.append(0)
+        if (((~val) & mask) & obs) == 0:
+            stuck_values.append(1)
+
+        if stuck_values:
+            obs_count = obs.bit_count()
+            best_activation = min(
+                [ones if stuck == 0 else zeros for stuck in stuck_values]
+            )
+            score = (0 if len(stuck_values) == 2 else 1, obs_count, best_activation, idx)
+            scored.append((score, idx, stuck_values))
+
+    return {idx: values_for_idx for _, idx, values_for_idx in sorted(scored)}
+
+
 def _candidate_map(inputs, latches, outputs, gates_raw, timings):
     """Build a candidate map; simulation filters only reject, SAT still proves."""
     t_filter = time.time()
@@ -127,11 +193,14 @@ def _candidate_map(inputs, latches, outputs, gates_raw, timings):
         if not EXHAUSTIVE_CHECK and len(gates_raw) <= FAULT_SIM_MAX_GATES:
             sim_sa0, sim_sa1 = _simulation_candidates(inputs, latches, outputs, gates_raw)
             result = {}
-            for idx in sim_sa0:
-                result.setdefault(idx, []).append(0)
-            for idx in sim_sa1:
-                result.setdefault(idx, []).append(1)
+            for idx in sorted(sim_sa0 | sim_sa1):
+                if idx in sim_sa0:
+                    result.setdefault(idx, []).append(0)
+                if idx in sim_sa1:
+                    result.setdefault(idx, []).append(1)
             return result
+        if not EXHAUSTIVE_CHECK and RANDOM_OBS_SIM:
+            return _random_observability_candidates(inputs, latches, outputs, gates_raw)
         return _signature_candidates(inputs, latches, gates_raw)
     finally:
         timings["Filter"] += time.time() - t_filter
@@ -147,7 +216,7 @@ def _limit_candidates(candidates, gate_count):
 
     limited = {}
     remaining = limit
-    for idx in sorted(candidates):
+    for idx in candidates:
         if remaining <= 0:
             break
         values = candidates[idx][:remaining]
