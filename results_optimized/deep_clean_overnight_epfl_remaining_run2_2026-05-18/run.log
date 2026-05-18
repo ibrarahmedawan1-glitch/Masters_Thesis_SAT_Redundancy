@@ -1,0 +1,34 @@
+nohup: ignoring input
+Output: results_optimized/deep_clean_overnight_epfl_remaining_run2_2026-05-18/sat_ablation_2026-05-18_03-29-06.csv
+Per-circuit budget: 3600.0s; budgets=1000,5000,20000,100000
+Circuits: 5; variants: cex_window_deep_current
+
+cex_window_deep_current epfl_arithmetic_sin.aag              5416->5375   rm=41   pass=PASS sat=3614.59s total=3642.44s chk=4663   tfi=19  win=1   waudit=0   cone=0   glob=0   cexpr=40218 tficex=31820 aud=0   /0   abort=TIME_BUDGET_CHECKPOINT
+cex_window_deep_current epfl_arithmetic_sqrt.aag            24618->24562  rm=56   pass=PASS sat=2586.88s total=3600.23s chk=4787   tfi=0   win=22  waudit=0   cone=0   glob=0   cexpr=120614 tficex=146737 aud=0   /0   abort=TIME_BUDGET_CHECKPOINT
+cex_window_deep_current epfl_arithmetic_div.aag             57247->57014  rm=233  pass=PASS sat=1968.76s total=3878.50s chk=3575   tfi=8   win=74  waudit=0   cone=0   glob=0   cexpr=796002 tficex=790619 aud=0   /0   abort=TIME_BUDGET_CHECKPOINT
+cex_window_deep_current epfl_arithmetic_log2.aag            32060->32037  rm=23   pass=PASS sat=1308.81s total=3601.92s chk=8223   tfi=13  win=0   waudit=0   cone=0   glob=0   cexpr=96539 tficex=126831 aud=0   /0   abort=TIME_BUDGET_CHECKPOINT
+cex_window_deep_current epfl_random_control_mem_ctrl.aag    46836->46761  rm=75   pass=PASS sat= 148.74s total=3601.92s chk=7389   tfi=1   win=34  waudit=0   cone=0   glob=0   cexpr=44017 tficex=181405 aud=0   /0   abort=TIME_BUDGET_CHECKPOINT
+
+Summary by circuit:
+  benchmark_suites/epfl/epfl_arithmetic_div.aag
+    max removal: cex_window_deep_current rm=233 total=3878.4991s
+    fastest:     cex_window_deep_current rm=233 total=3878.4991s
+    best rm/sat: cex_window_deep_current rm=233 sat=1968.7622s
+  benchmark_suites/epfl/epfl_arithmetic_log2.aag
+    max removal: cex_window_deep_current rm=23 total=3601.9226s
+    fastest:     cex_window_deep_current rm=23 total=3601.9226s
+    best rm/sat: cex_window_deep_current rm=23 sat=1308.8061s
+  benchmark_suites/epfl/epfl_arithmetic_sin.aag
+    max removal: cex_window_deep_current rm=41 total=3642.4445s
+    fastest:     cex_window_deep_current rm=41 total=3642.4445s
+    best rm/sat: cex_window_deep_current rm=41 sat=3614.5912s
+  benchmark_suites/epfl/epfl_arithmetic_sqrt.aag
+    max removal: cex_window_deep_current rm=56 total=3600.2347s
+    fastest:     cex_window_deep_current rm=56 total=3600.2347s
+    best rm/sat: cex_window_deep_current rm=56 sat=2586.8796s
+  benchmark_suites/epfl/epfl_random_control_mem_ctrl.aag
+    max removal: cex_window_deep_current rm=75 total=3601.9240s
+    fastest:     cex_window_deep_current rm=75 total=3601.9240s
+    best rm/sat: cex_window_deep_current rm=75 sat=148.7405s
+
+Saved: results_optimized/deep_clean_overnight_epfl_remaining_run2_2026-05-18/sat_ablation_2026-05-18_03-29-06.csv

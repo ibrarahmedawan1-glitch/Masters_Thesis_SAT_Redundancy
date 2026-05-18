@@ -49,13 +49,27 @@ ALG10_MODE=deep_resume ALG10_MAX_CIRCUIT_SECONDS=600 ALG10_BUDGETS=1000,5000,200
 
 Checkpoints are written under `results_optimized/alg10_checkpoints/` by default. Set `ALG10_CHECKPOINT_DIR=/path/to/dir` to choose another directory, and `ALG10_RESET_CHECKPOINT=1` to ignore an existing checkpoint.
 
-Algorithm 10 also has a sound TFI constancy tier before the global miter:
+Algorithm 10 also has sound middle tiers before the full global miter:
 
 ```bash
 ALG10_TFI_CONSTANCY=1 ALG10_TFI_BUDGET=500 ALG10_TFI_MAX_CONE_GATES=2000 python3 main.py
+ALG10_WINDOW_MITER=1 ALG10_WINDOW_AUDIT=1 ALG10_WINDOW_LEVELS=5 ALG10_WINDOW_BUDGET=500 python3 main.py
+ALG10_CONE_MITER=1 ALG10_CONE_BUDGET=1000 ALG10_CONE_MAX_GATES=5000 python3 main.py
+ALG10_CEX_PRUNING=1 python3 main.py
 ```
 
+The normal Algorithm 10 path in `main.py` now defaults to the best tested profile: current ordering, TFI constancy, audited bounded TFO window, exact affected-output cone, global fallback, and CEX pruning. The variables above are still useful when running ablations or intentionally disabling a tier.
+
 TFI `UNSAT` can commit a stuck-at constant safely. TFI `SAT`, timeout, or skip still escalates to the global miter, so the tier does not remove candidates from coverage.
+The bounded TFO window tier is an UNSAT-only over-observable proof: it compares complete fanin cones of nearby fanout boundary roots. With `ALG10_WINDOW_AUDIT=1`, the roots must form a complete observable cut; otherwise the tier skips and escalates. Window `UNSAT` can commit safely only under that complete-cut condition; window `SAT`, timeout, or skip still escalates.
+The cone miter compares only the output/latch-next roots affected by a candidate, but it encodes their complete fanin cone. Cone `UNSAT` can commit safely; cone `SAT`, timeout, or skip still escalates to global SAT.
+CEX pruning is rejection-only. TFI CEXs only skip future TFI constancy checks; window/cone/global CEXs prune a candidate only after full-circuit simulation proves that exact candidate creates a real observable mismatch.
+
+Run SAT-side ablation experiments:
+
+```bash
+python3 sat_ablation_experiments.py --circuits benchmarks/c7552.aag benchmark_suites/epfl/epfl_arithmetic_sin.aag --seconds 30
+```
 
 The full run generates synthetic circuits, copies `.aag` files from `benchmarks/`, optimizes every dataset circuit, verifies each output, and writes a CSV report to:
 

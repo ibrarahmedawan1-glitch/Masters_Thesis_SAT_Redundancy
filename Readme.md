@@ -15,7 +15,7 @@ python3 main.py
 The menu exposes algorithms `1-10`. The two current research engines are:
 
 - **Algorithm 9**: committed in-memory incremental SAT with candidate filtering and final ABC CEC.
-- **Algorithm 10**: checkpointed budget-cycling SAT engine with a sound TFI constancy tier, global miter fallback, safe partial outputs, and resume support.
+- **Algorithm 10**: checkpointed budget-cycling SAT engine with sound TFI constancy and affected-output cone miter tiers, global miter fallback, safe partial outputs, and resume support.
 
 Algorithm 10 is the preferred engine when a large circuit might take too long. It writes a latest safe `.aag` and checkpoint when the per-circuit time limit is reached, allowing a later deep-resume run.
 
@@ -93,6 +93,29 @@ results_optimized/alg10_checkpoints/
 ```
 
 Set `ALG10_RESET_CHECKPOINT=1` to ignore an existing checkpoint.
+
+Algorithm 10 runs sound proof tiers in this order: TFI constancy, optional bounded TFO window miter, exact affected-output cone miter, then full global miter. The cone tier is enabled by default and can be tuned with:
+
+```bash
+ALG10_WINDOW_MITER=1 \
+ALG10_WINDOW_AUDIT=1 \
+ALG10_WINDOW_LEVELS=5 \
+ALG10_WINDOW_BUDGET=500 \
+python3 main.py
+
+ALG10_CONE_MITER=1 \
+ALG10_CONE_BUDGET=1000 \
+ALG10_CONE_MAX_GATES=5000 \
+python3 main.py
+
+ALG10_CEX_PRUNING=1 \
+python3 main.py
+```
+
+The normal Algorithm 10 path now selects the best tested profile by default: current ordering, TFI constancy, audited bounded window, exact cone, global fallback, and rejection-only CEX pruning. Keep the knobs above for ablations or for intentionally disabling a tier.
+
+Use `sat_ablation_experiments.py` to compare candidate ordering, bounded-window, cone, global-only, commit-unit, and rebuild-threshold variants before promoting a setting into the main workflow.
+The bounded window tier commits only when the audited boundary roots form a complete observable cut. CEX pruning is rejection-only: TFI CEXs only skip TFI constancy checks, and window/cone/global CEXs prune a candidate only after full-circuit simulation proves that exact candidate creates a real observable mismatch.
 
 ## Benchmarks
 

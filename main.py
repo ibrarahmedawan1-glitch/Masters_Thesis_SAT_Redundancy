@@ -291,17 +291,29 @@ def configure_algorithm10_run():
     mode = prompt_choice("Select Alg 10 mode (1-2) [1]: ", {"1", "2"}, "1")
 
     if mode == "2":
-        RUN_MODE_LABEL = "alg10_deep_resume"
+        RUN_MODE_LABEL = "alg10_deep_resume_cex_window"
         os.environ["ALG10_MODE"] = "deep_resume"
         os.environ.setdefault("ALG10_BUDGETS", "1000,5000,20000,100000")
         os.environ.setdefault("ALG10_MAX_CIRCUIT_SECONDS", "600")
         set_int("ALG10_REBUILD_AFTER_COMMITS", 100)
     else:
-        RUN_MODE_LABEL = "alg10_fast_save"
+        RUN_MODE_LABEL = "alg10_fast_save_cex_window"
         os.environ["ALG10_MODE"] = "fast_save"
         os.environ.setdefault("ALG10_BUDGETS", "100,1000,5000")
         os.environ.setdefault("ALG10_MAX_CIRCUIT_SECONDS", "60")
         set_int("ALG10_REBUILD_AFTER_COMMITS", 100)
+
+    # Best tested Algorithm 10 profile as of 2026-05-17:
+    # current ordering + TFI + audited bounded window + exact cone + global fallback
+    # with rejection-only CEX pruning. Environment variables may still override it.
+    os.environ.setdefault("ALG10_TFI_CONSTANCY", "1")
+    os.environ.setdefault("ALG10_WINDOW_MITER", "1")
+    os.environ.setdefault("ALG10_WINDOW_AUDIT", "1")
+    os.environ.setdefault("ALG10_WINDOW_LEVELS", "5")
+    os.environ.setdefault("ALG10_CONE_MITER", "1")
+    os.environ.setdefault("ALG10_CANDIDATE_ORDER", "current")
+    os.environ.setdefault("ALG10_CEX_PRUNING", "1")
+    os.environ.setdefault("ALG10_CEX_PRUNING_BATCH_SIZE", "512")
 
     MAX_DATASET_GATES = 0
     set_int("MAX_DATASET_GATES", MAX_DATASET_GATES)
@@ -388,6 +400,13 @@ def configure_algorithm10_run():
     print(f"    Dataset profile: {DATASET_PROFILE_LABEL}")
     print(f"    Budgets: {os.environ.get('ALG10_BUDGETS')}")
     print(f"    Max circuit seconds: {os.environ.get('ALG10_MAX_CIRCUIT_SECONDS')}")
+    print(f"    Candidate order: {os.environ.get('ALG10_CANDIDATE_ORDER', 'current')}")
+    print(f"    TFI constancy: {os.environ.get('ALG10_TFI_CONSTANCY', '1')}")
+    print(f"    Window miter: {os.environ.get('ALG10_WINDOW_MITER', '0')}")
+    print(f"    Window audit: {os.environ.get('ALG10_WINDOW_AUDIT', '1')}")
+    print(f"    Cone miter: {os.environ.get('ALG10_CONE_MITER', '1')}")
+    print(f"    CEX pruning: {os.environ.get('ALG10_CEX_PRUNING', '0')}")
+    print(f"    CEX audit: {os.environ.get('ALG10_AUDIT_CEX_PRUNING', '0')}")
     print(f"    Checkpoint dir: {os.environ.get('ALG10_CHECKPOINT_DIR', 'results_optimized/alg10_checkpoints')}")
     if INCLUDE_CUSTOM_CIRCUITS:
         print(f"    Custom circuit path: {CUSTOM_CIRCUIT_PATH}")
@@ -532,7 +551,8 @@ if __name__ == "__main__":
                     "0", "0", "0", "0", "0", "0",
                     0, 0, 0, 0, 0, "SKIPPED_GATE_LIMIT",
                     input_metrics["Area_AND2"], input_metrics["Area_AND2"], input_metrics["Area_AND2"],
-                    0, 0, 0, 0, 0, "", "", "", "", "", "", "", "", "", "", "", "SKIPPED_GATE_LIMIT"
+                    0, 0, 0, 0, 0, "", "", "", "", "", "", "", "", "", "", "",
+                    "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "SKIPPED_GATE_LIMIT"
                 ])
                 continue
         except Exception:
@@ -589,8 +609,22 @@ if __name__ == "__main__":
                 timings.get("TFI_Checks", ""), timings.get("TFI_Query_SAT", ""),
                 timings.get("TFI_Query_UNSAT", ""), timings.get("TFI_Timeouts", ""),
                 timings.get("TFI_Skipped", ""),
+                timings.get("Window_Checks", ""), timings.get("Window_Query_SAT", ""),
+                timings.get("Window_Query_UNSAT", ""), timings.get("Window_Timeouts", ""),
+                timings.get("Window_Skipped", ""), timings.get("Window_Audit_Fail", ""),
+                timings.get("Cone_Checks", ""), timings.get("Cone_Query_SAT", ""),
+                timings.get("Cone_Query_UNSAT", ""), timings.get("Cone_Timeouts", ""),
+                timings.get("Cone_Skipped", ""),
                 timings.get("Global_Checks", ""), timings.get("Global_Query_SAT", ""),
                 timings.get("Global_Query_UNSAT", ""), timings.get("Global_Timeouts", ""),
+                timings.get("CEX_Prune_Events", ""), timings.get("CEX_Prune_Checked", ""),
+                timings.get("CEX_Pruned", ""), timings.get("CEX_TFI_Prune_Events", ""),
+                timings.get("CEX_TFI_Prune_Checked", ""), timings.get("CEX_TFI_Pruned", ""),
+                timings.get("CEX_Pruning_Enabled", ""),
+                timings.get("CEX_Audit_Enabled", ""), timings.get("CEX_Audit_Checked", ""),
+                timings.get("CEX_Audit_SAT", ""), timings.get("CEX_Audit_False_Prunes", ""),
+                timings.get("CEX_Audit_Timeouts", ""), timings.get("CEX_Audit_Skipped", ""),
+                timings.get("CEX_Audit_Limit_Hit", ""),
                 status
             ])
             
@@ -602,7 +636,8 @@ if __name__ == "__main__":
                 0, 0, 0, "SKIPPED", 0, 0, "SKIPPED",
                 "0", "0", "0", "0", "0", "0",
                 "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
-                "", "", "", "", "", "", "", "", "", "SKIPPED"
+                "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+                "", "", "", "", "", "", "", "", "", "", "", "", "SKIPPED"
             ])
             continue
         except Exception as e:
@@ -613,7 +648,8 @@ if __name__ == "__main__":
                 0, 0, 0, "ERR", 0, 0, "ERR",
                 "0", "0", "0", "0", "0", "0",
                 "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
-                "", "", "", "", "", "", "", "", "", "ERROR"
+                "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+                "", "", "", "", "", "", "", "", "", "", "", "", "ERROR"
             ])
 
     with open(REPORT_FILE, "w", newline="") as f:
@@ -631,9 +667,24 @@ if __name__ == "__main__":
             "SAT_Accepted_SA0", "SAT_Accepted_SA1", "Rebuilds",
             "SAT_Unresolved", "SAT_Max_Budget", "Checkpoint_Resume",
             "TFI_Checks", "TFI_Query_SAT", "TFI_Query_UNSAT", "TFI_Timeouts", "TFI_Skipped",
+            "Window_Checks", "Window_Query_SAT", "Window_Query_UNSAT", "Window_Timeouts",
+            "Window_Skipped", "Window_Audit_Fail",
+            "Cone_Checks", "Cone_Query_SAT", "Cone_Query_UNSAT", "Cone_Timeouts", "Cone_Skipped",
             "Global_Checks", "Global_Query_SAT", "Global_Query_UNSAT", "Global_Timeouts",
+            "CEX_Prune_Events", "CEX_Prune_Checked", "CEX_Pruned",
+            "CEX_TFI_Prune_Events", "CEX_TFI_Prune_Checked", "CEX_TFI_Pruned",
+            "CEX_Pruning_Enabled",
+            "CEX_Audit_Enabled", "CEX_Audit_Checked", "CEX_Audit_SAT",
+            "CEX_Audit_False_Prunes", "CEX_Audit_Timeouts", "CEX_Audit_Skipped",
+            "CEX_Audit_Limit_Hit",
             "Verify"
         ])
+        width = 73
+        for row in stats:
+            if len(row) < width:
+                row.extend([""] * (width - len(row)))
+            elif len(row) > width:
+                del row[width:]
         writer.writerows(stats)
 
     print(f"\n[DONE] Saved report to {REPORT_FILE}")

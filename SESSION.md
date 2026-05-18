@@ -218,6 +218,179 @@ Algorithm 1 is the slowest baseline. If `main.py` appears stuck on `alu_8bit.aag
 - `generators.py`: synthetic AAG benchmark generation.
 - `verifier.py`: ABC CEC first through `abc_utils`, Python SAT miter fallback.
 - `optimizer_alg*.py`: optimizer engines called by `main.py`.
+
+## Closeout 2026-05-18: Algorithm 10 CEX-Window Audit State
+
+Current thesis boundary is unchanged and must stay explicit:
+
+- combinational AIG/AAG only;
+- latches only as combinational cut boundaries;
+- greedy proof-driven stuck-at constant redundancy removal;
+- no maximum/optimal reduction claim;
+- no sequential redundancy claim;
+- no simulation-based acceptance;
+- final ABC CEC is mandatory for every reported optimized circuit.
+
+### Current Algorithm 10 Default
+
+When Algorithm 10 is selected through `main.py`, the best current point-of-time profile is now:
+
+- current candidate ordering;
+- TFI constancy SAT;
+- audited bounded TFO window miter;
+- exact affected-output cone miter;
+- global configurable-fault miter fallback;
+- rejection-only CEX pruning.
+
+The run labels are:
+
+- `alg10_fast_save_cex_window`;
+- `alg10_deep_resume_cex_window`.
+
+The most important environment knobs are:
+
+- `ALG10_CEX_PRUNING=1`;
+- `ALG10_WINDOW_MITER=1`;
+- `ALG10_WINDOW_AUDIT=1`;
+- `ALG10_AUDIT_CEX_PRUNING=1` for expensive recall auditing, off by default;
+- `ALG10_AUDIT_CEX_PRUNING_BUDGET`;
+- `ALG10_AUDIT_CEX_PRUNING_MAX`.
+
+### Latest Result Interpretation
+
+Latest broad fast/resumed CSV:
+
+```text
+results_optimized/thesis_results_ALG10_alg10_fast_save_cex_window_real_suites_planted_2026-05-17_23-22-24.csv
+```
+
+It reported 38/38 `Verify=PASS`.
+
+Important rows:
+
+- `c7552`: 1693 -> 1679, removed 14, PASS.
+- `c6288`: 1870 -> 1870, removed 0, PASS, but many candidates were rejected by CEX pruning.
+- EPFL `sin`: 5416 -> 5389, removed 27, PASS, TFI dominated.
+- EPFL `sqrt`: 24618 -> 24582, removed 36, PASS, window tier found 13 UNSAT proofs.
+- EPFL `div`: 57247 -> 57203, removed 44, PASS, TFI dominated.
+- EPFL `log2`: 32060 -> 32052, removed 8, PASS.
+- EPFL `mem_ctrl`: 46836 -> 46834, removed 2, PASS.
+
+Caveat: this broad run resumed checkpoints. Thesis tables should use clean isolated runs with `ALG10_RESET_CHECKPOINT=1`.
+
+Clean ablation evidence before closeout:
+
+- `c7552`, 15s: `cex_window_current` matched the 14-removal best result with much lower SAT time than non-CEX profiles.
+- EPFL `sin`, 20s: `cex_window_current` reached 39 removals versus 31 for the non-CEX current profile.
+- EPFL `sqrt`, 20s: `cex_window_current` found 36 removals where earlier short current/window/global-only profiles found 0.
+- `c6288`, 20s: CEX pruning made the run complete quickly but still found 0 removals, which is useful negative evidence for a hard multiplier.
+
+### CEX Recall Audit
+
+External review correctly identified that final CEC cannot validate CEX pruning quality. CEX pruning is rejection-only, so a bad prune causes a missed redundancy, not a wrong circuit. ABC CEC would still return PASS.
+
+Implemented `ALG10_AUDIT_CEX_PRUNING=1`:
+
+- every output-level CEX prune candidate is immediately rechecked by a full exact observable miter in the same committed context;
+- SAT confirms the prune;
+- UNSAT is counted as `CEX_Audit_False_Prunes` and the candidate is not dropped;
+- timeout/skip also leaves the candidate alive in audit mode.
+
+Audit telemetry:
+
+- `CEX_Audit_Enabled`;
+- `CEX_Audit_Checked`;
+- `CEX_Audit_SAT`;
+- `CEX_Audit_False_Prunes`;
+- `CEX_Audit_Timeouts`;
+- `CEX_Audit_Skipped`;
+- `CEX_Audit_Limit_Hit`.
+
+Final smoke before closing:
+
+```text
+venv/bin/python -m py_compile optimizer_alg10_tiered.py main.py sat_ablation_experiments.py
+venv/bin/python test_alg10_checkpoint.py
+venv/bin/python sat_ablation_experiments.py --circuits benchmarks/c432.aag --variants cex_window_audit --seconds 5 --budgets 100,1000 --output-dir /tmp/alg10_audit_ablation_final_smoke
+```
+
+Results:
+
+- compile passed;
+- Algorithm 10 checkpoint tests passed;
+- audit ablation on `c432` produced 125 -> 121, removed 4, `Verify=PASS`;
+- `CEX_Audit_Checked=1088`;
+- `CEX_Audit_SAT=1088`;
+- `CEX_Audit_False_Prunes=0`;
+- `Window_Query_UNSAT=2`.
+
+### Contribution Assessment
+
+Current state is more than a simple software project if it is written carefully. The contribution is not "beating ABC" and not "a general AIG optimizer." The defensible research contribution is:
+
+> A correctness-gated SAT architecture for combinational AIG stuck-at constant redundancy removal, combining tiered proof obligations, audited bounded-window acceptance, rejection-only CEX pruning, recall auditing for missed-prune risk, and final independent ABC CEC.
+
+Research-grade elements:
+
+- formal proof tiers with explicit soundness conditions;
+- global configurable-fault encoding with assumption audit;
+- audited bounded window that converts a risky local technique into a conditional proof tier;
+- CEX pruning separated from acceptance;
+- CEX recall audit that measures pruning omissions instead of relying on CEC;
+- tier-by-tier telemetry and ablation evidence.
+
+Engineering/project elements:
+
+- menu pipeline;
+- checkpointing;
+- CSV/report plumbing;
+- ABC conversion wrapper;
+- benchmark orchestration.
+
+The thesis should present both, but the contribution claim should focus on the SAT-side proof/pruning architecture and the empirical ablations.
+
+### Next Best Steps
+
+1. Run capped CEX recall audit on `c7552` and EPFL `sqrt`.
+   - Start with `ALG10_AUDIT_CEX_PRUNING_MAX=500` or `1000`.
+   - Goal: show zero false prunes on more meaningful circuits before trusting large CEX pruning tables.
+
+2. Run clean deep mode on promising circuits with isolated checkpoints:
+   - `sin`;
+   - `sqrt`;
+   - `div`;
+   - `log2`;
+   - `mem_ctrl`.
+
+3. Build ABC baseline runner:
+   - `strash`;
+   - `dc2`;
+   - `dch`;
+   - `fraig`;
+   - `resyn2` or explicit equivalent rewrite/refactor script.
+
+4. Keep hard zero circuits as diagnostic:
+   - `c6288`;
+   - EPFL `multiplier`;
+   - EPFL `hyp`;
+   - EPFL `arbiter`.
+
+5. Consider next SAT-side implementation after audit/deep evidence:
+   - structural blocked-candidate detection after commits;
+   - adaptive tier routing;
+   - candidate ordering by TFI or affected-cone size.
+
+Do not pivot to MaxSAT, full FRAIG, or sequential reasoning in the main thesis path.
+
+### Final Reviewer Prompt
+
+The final closeout prompt for external reviewers is:
+
+```text
+LLM_REVIEW_PROMPT_FINAL_SAT_CEX_AUDIT_CLOSEOUT.md
+```
+
+It includes the current architecture, latest results, CEX recall audit, and asks specifically whether this is research-grade and what the next SAT-side step should be.
 - `benchmarks/`: static `.aag` benchmark inputs copied into the generated dataset.
 - `benchmark_suites/`: reusable prepared benchmark suites copied into each `main.py` dataset run when `INCLUDE_BENCHMARK_SUITES` is enabled.
 - `dataset_benchmarks/`: regenerated by `main.py`; do not treat contents as permanent source.
@@ -419,3 +592,165 @@ Tomorrow's recommended next step:
 2. Implement exact affected-output cone miter as the next sound middle tier.
 3. Keep Algorithm 10's checkpoint/resume wrapper as the orchestration shell.
 4. Add telemetry separating inherited checkpoint reductions from newly found reductions in the current run.
+
+## 2026-05-17 Algorithm 10 Cone-Miter Tier
+
+Implemented the recommended exact affected-output cone miter as a new sound Algorithm 10 middle tier between TFI constancy and full global SAT.
+
+Behavior:
+
+- `optimizer_alg10_tiered.py` now runs proof tiers in this order: TFI constancy, exact affected-output cone miter, then full global miter.
+- The cone tier identifies only output/latch-next roots in the candidate's fanout, then encodes the complete fanin cone for those affected roots.
+- Cone `UNSAT` can safely commit a stuck-at replacement; cone `SAT`, timeout, or skip still falls through toward global SAT.
+- Accepted cone replacements are accumulated against a working gate list, so later cone proofs see earlier committed replacements before the phase rebuild.
+- New knobs: `ALG10_CONE_MITER`, `ALG10_CONE_BUDGET`, and `ALG10_CONE_MAX_GATES`.
+- New CSV telemetry: `Cone_Checks`, `Cone_Query_SAT`, `Cone_Query_UNSAT`, `Cone_Timeouts`, and `Cone_Skipped`.
+
+Smoke checks:
+
+- `venv/bin/python -m py_compile main.py optimizer_alg10_tiered.py test_alg10_checkpoint.py`
+- `venv/bin/python test_alg10_checkpoint.py`
+  - ODC case: `Cone_Query_UNSAT=1`, `Global_Query_UNSAT=0`, CEC `PASS`.
+  - TFI-constant case still accepted by TFI, CEC `PASS`.
+  - c432 checkpoint/deep-resume still CEC `PASS`; deep resume reports cone UNSAT reductions.
+- `venv/bin/python test_algorithms_1_to_10.py`: algorithms `1-10` on `c17` all CEC `PASS`; algorithms `8-10` on `c432` all CEC `PASS`.
+- `main.py` Algorithm 10 custom `benchmarks/c432.aag`: `125 -> 121`, CEC `PASS`, CSV had 53 header fields and 53 row fields, with `Cone_Query_UNSAT=2`.
+
+Remaining recommended next step:
+
+- Add telemetry separating reductions inherited from a checkpoint from newly found reductions in the current run.
+
+## 2026-05-17 SAT Ablation Experiments
+
+Responded to external LLM feedback by adding testable Algorithm 10 SAT-side knobs instead of guessing a new default.
+
+Implemented:
+
+- `ALG10_CANDIDATE_ORDER`: `current`, `reverse_topo`, `cone_size`, `fanout_desc`, `random`, and related order aliases.
+- `ALG10_AUDIT_ASSUMPTIONS`: asserts the global configurable-fault miter receives exactly `2A + 1` non-contradictory assumptions. This directly tests the "free fault controls" criticism. Current global path passes the audit because it builds `control_state = [-f0...] + [-f1...]`.
+- Optional bounded TFO window tier:
+  - knobs: `ALG10_WINDOW_MITER`, `ALG10_WINDOW_LEVELS`, `ALG10_WINDOW_BUDGET`, `ALG10_WINDOW_MAX_CONE_GATES`;
+  - the window tier is UNSAT-only and over-observable: it compares complete fanin cones of nearby fanout boundary roots;
+  - window `UNSAT` can commit; `SAT`, timeout, or skip still escalates.
+- New telemetry: `Window_Checks`, `Window_Query_SAT`, `Window_Query_UNSAT`, `Window_Timeouts`, and `Window_Skipped`.
+- Added `sat_ablation_experiments.py` for repeatable variant matrices with isolated checkpoints and final ABC CEC on every row.
+- Added a window-only ODC regression to `test_alg10_checkpoint.py`.
+
+Checks:
+
+- `venv/bin/python test_alg10_checkpoint.py`: ODC cone-only and window-only reductions both CEC `PASS`; c432 checkpoint/deep-resume still CEC `PASS`.
+- `venv/bin/python test_algorithms_1_to_10.py`: algorithms `1-10` on `c17` all CEC `PASS`; algorithms `8-10` on `c432` all CEC `PASS`.
+- `main.py` Algorithm 10 custom `benchmarks/c432.aag`: `125 -> 121`, CEC `PASS`, CSV had 58 header fields and 58 row fields after adding window telemetry.
+
+Ablation result CSVs:
+
+- `results_optimized/sat_ablation_2026-05-17_18-21-22/sat_ablation_2026-05-17_18-21-22.csv`
+- `results_optimized/sat_ablation_2026-05-17_18-23-29/sat_ablation_2026-05-17_18-23-29.csv`
+- `results_optimized/sat_ablation_2026-05-17_18-25-23/sat_ablation_2026-05-17_18-25-23.csv`
+- `results_optimized/sat_ablation_2026-05-17_18-31-37/sat_ablation_2026-05-17_18-31-37.csv`
+
+Observed so far:
+
+- `c7552`, 15s: current found 4 removed, reverse found 6, `window_reverse` found 14, and global-only audit found 14. Window got the same reduction as global-only with lower SAT time.
+- `c7552`, 30s: current found 6, `window_current` and `window_reverse` found 14, global-only current/audit found 14. Window used about 23.5-23.7s SAT; global-only used about 30s SAT.
+- EPFL `router`: all variants found the same 6 removals; global-only was fastest on this small circuit.
+- EPFL `sin`: current-order TFI dominated. Current/window-current/rebuild-current found 31 removed; reverse/window-reverse found fewer; global-only found 0 under 20-30s.
+- `c6288`, EPFL `arbiter`, and EPFL `sqrt`: no reductions in 20s for current/window-current/global-only. These are not useful short ablation targets without stronger pruning or longer budgets.
+
+Current interpretation:
+
+- Do not promote reverse ordering globally; it hurts EPFL `sin`.
+- Do not promote global-only globally; it is fast on small router/c432 but poor on `sin`.
+- The best candidate for a next experimental profile is current ordering plus optional bounded window before exact cone/global. It improves `c7552` without hurting `sin` in the tested budget, but it still needs broader validation.
+- The next truly new improvement should likely be CEX-guided pruning or a more selective candidate generator for hard circuits where all current tiers spend the whole budget with zero removals.
+
+## 2026-05-17 External Feedback Follow-Up
+
+External reviewers flagged the bounded TFO window as correctness-critical. The right conclusion is:
+
+- A bounded window UNSAT proof is sound only if the chosen boundary roots form a complete observable cut: every fanout path from the candidate gate to any real PO/latch-next root must pass through at least one monitored window root.
+- Window SAT is inconclusive and must not be used as a global counterexample.
+- Local/window CEX values must not be reused for global candidate pruning. Future CEX pruning must use concrete global PI assignments and directly simulate each candidate's faulty output behavior.
+
+Implemented hardening:
+
+- Added `ALG10_WINDOW_AUDIT`, default enabled.
+- Added `_window_roots_form_observable_cut(...)`; if the audit fails, the window tier returns skip/escalates instead of committing.
+- Added `Window_Audit_Fail` telemetry to Algorithm 10, `main.py`, and `sat_ablation_experiments.py`.
+- Updated `LLM_REVIEW_PROMPT_LATEST_SAT_ABLATION.md`, `THESIS_EXPERIMENT_HISTORY.md`, `Readme.md`, and `COMMANDS.md` to state the complete-cut condition.
+
+Checks after hardening:
+
+- `venv/bin/python -m py_compile main.py optimizer_alg10_tiered.py sat_ablation_experiments.py test_alg10_checkpoint.py`
+- `venv/bin/python test_alg10_checkpoint.py`: window-only ODC still CEC `PASS`, `Window_Query_UNSAT=1`, `Window_Audit_Fail=0`.
+- `sat_ablation_experiments.py --circuits benchmarks/c7552.aag --seconds 15 --variants current window_current global_only_current`:
+  - current: `1693 -> 1689`, 4 removed, `PASS`.
+  - `window_current`: `1693 -> 1679`, 14 removed, `PASS`, `Window_Query_UNSAT=7`, `Window_Audit_Fail=0`, SAT 10.93s.
+  - `global_only_current`: `1693 -> 1679`, 14 removed, `PASS`, SAT 14.98s.
+- `main.py` Algorithm 10 custom `benchmarks/c432.aag` with `ALG10_WINDOW_MITER=1`: `125 -> 121`, CEC `PASS`, CSV had 59 header fields and 59 row fields, `Window_Audit_Fail=0`.
+
+Decision:
+
+- Keep bounded window optional, not default, until broader validation.
+- Treat CEX-guided pruning as the next implementation target, but only using global PI assignments plus direct faulty-circuit simulation per candidate.
+
+## 2026-05-17 Algorithm 10 CEX-Guided Pruning
+
+Implemented `ALG10_CEX_PRUNING=1` in Algorithm 10 as a rejection-only optimization.
+
+Soundness rule:
+
+- CEX pruning never accepts a stuck-at replacement.
+- TFI SAT models can only skip future TFI-constancy checks when the concrete assignment disproves the candidate's stuck value.
+- Window, exact-cone, and global SAT models are converted to concrete PI/latch assignments, then each pending candidate is simulated through the full circuit. A candidate is pruned only if its own stuck-at faulty circuit differs from the good circuit at a real output/latch-next root.
+- Local/window SAT CEXs are still not treated as proofs by themselves.
+
+Implementation:
+
+- Added bit-parallel full-circuit candidate simulation for output-CEX pruning.
+- Added TFI-CEX pruning for the TFI tier.
+- Added telemetry: `CEX_Prune_Events`, `CEX_Prune_Checked`, `CEX_Pruned`, `CEX_TFI_Prune_Events`, `CEX_TFI_Prune_Checked`, `CEX_TFI_Pruned`, and `CEX_Pruning_Enabled`.
+- Added ablation variants: `cex_current`, `cex_window_current`, and `global_only_cex_current`.
+
+Validation:
+
+- `venv/bin/python -m py_compile optimizer_alg10_tiered.py main.py sat_ablation_experiments.py test_alg10_checkpoint.py`: pass.
+- `venv/bin/python test_alg10_checkpoint.py`: all Algorithm 10 smoke checks CEC `PASS`.
+- `c7552`, 15s:
+  - `current`: 4 removed, SAT 10.89s, checkpoint timeout, CEC `PASS`.
+  - `cex_current`: 14 removed, SAT 8.60s, complete, `CEX_Pruned=19238`, CEC `PASS`.
+  - `window_current`: 14 removed, SAT 10.15s, checkpoint timeout, CEC `PASS`.
+  - `cex_window_current`: 14 removed, SAT 4.34s, complete, `CEX_Pruned=11975`, CEC `PASS`.
+  - `global_only_cex_current`: 14 removed, SAT 3.12s, complete, `CEX_Pruned=6477`, CEC `PASS`.
+- EPFL `sin`, 20s:
+  - `current`: 31 removed, SAT 19.98s, `TFI_Query_UNSAT=15`, CEC `PASS`.
+  - `cex_current`: 39 removed, SAT 16.89s, `TFI_Query_UNSAT=19`, `CEX_TFI_Pruned=21232`, CEC `PASS`.
+  - `cex_window_current`: 39 removed, SAT 11.16s, `CEX_TFI_Pruned=21232`, `CEX_Pruned=9863`, CEC `PASS`.
+  - `global_only_cex_current`: 0 removed, still timed out, CEC `PASS`; global-only is still not a good `sin` default.
+- `c6288`, 20s:
+  - `current`: 0 removed, SAT 16.28s, checkpoint timeout, CEC `PASS`.
+  - `cex_current`: 0 removed, SAT 2.46s, complete, `CEX_Pruned=7413`, `CEX_TFI_Pruned=3521`, CEC `PASS`.
+  - `global_only_cex_current`: 0 removed, SAT 1.69s, complete, `CEX_Pruned=3712`, CEC `PASS`.
+- Broader CEX-enabled pass:
+  - EPFL `router`, 20s: CEX profiles remove 6; `global_only_cex_current` SAT 0.05s, CEC `PASS`.
+  - EPFL `arbiter`, 20s: CEX profiles remove 0; `cex_current` pruned 23568 TFI candidates and 2792 output candidates, CEC `PASS`.
+  - EPFL `sqrt`, 20s: `cex_window_current` removed 36 where earlier short profiles found 0; SAT 3.16s, `Window_Query_UNSAT=13`, `CEX_Pruned=28378`, `CEX_TFI_Pruned=48978`, CEC `PASS`.
+
+Decision:
+
+- CEX pruning is now one of the strongest additions to test broadly.
+- It improves `c7552` reduction/time, improves EPFL `sin` reduction under the same budget, unlocks verified short-budget reductions on EPFL `sqrt`, and makes several hard zero-removal circuits spend far less time in SAT.
+- Keep it optional until broader validation, but it is thesis-worthy if the broader matrix confirms these trends.
+
+Pipeline attachment:
+
+- `main.py` Algorithm 10 now defaults to the best tested profile when selected from the menu:
+  - `ALG10_CANDIDATE_ORDER=current`
+  - `ALG10_TFI_CONSTANCY=1`
+  - `ALG10_WINDOW_MITER=1`
+  - `ALG10_WINDOW_AUDIT=1`
+  - `ALG10_WINDOW_LEVELS=5`
+  - `ALG10_CONE_MITER=1`
+  - `ALG10_CEX_PRUNING=1`
+- Fast-save and deep-resume labels now include `cex_window` so CSV files make the profile visible.
+- Environment variables can still override these defaults for ablations.

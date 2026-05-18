@@ -50,7 +50,17 @@ def write_tfi_constant_circuit(path):
         f.write("TFI constant: (a & b) & (a & ~b) = 0\n")
 
 
-def load_alg10(mode, checkpoint_dir, seconds, budgets, reset=False, tfi=True):
+def load_alg10(
+    mode,
+    checkpoint_dir,
+    seconds,
+    budgets,
+    reset=False,
+    tfi=True,
+    window=False,
+    cone=True,
+    order="current",
+):
     sys.modules.pop("optimizer_alg10_tiered", None)
     os.environ["ALG10_MODE"] = mode
     os.environ["ALG10_CHECKPOINT_DIR"] = checkpoint_dir
@@ -58,11 +68,38 @@ def load_alg10(mode, checkpoint_dir, seconds, budgets, reset=False, tfi=True):
     os.environ["ALG10_BUDGETS"] = budgets
     os.environ["ALG10_RESET_CHECKPOINT"] = "1" if reset else "0"
     os.environ["ALG10_TFI_CONSTANCY"] = "1" if tfi else "0"
+    os.environ["ALG10_WINDOW_MITER"] = "1" if window else "0"
+    os.environ["ALG10_WINDOW_AUDIT"] = "1"
+    os.environ["ALG10_WINDOW_LEVELS"] = "5"
+    os.environ["ALG10_CONE_MITER"] = "1" if cone else "0"
+    os.environ["ALG10_CANDIDATE_ORDER"] = order
     return importlib.import_module("optimizer_alg10_tiered")
 
 
-def run_case(src, out, mode, checkpoint_dir, seconds, budgets, reset=False, tfi=True):
-    optimizer = load_alg10(mode, checkpoint_dir, seconds, budgets, reset=reset, tfi=tfi)
+def run_case(
+    src,
+    out,
+    mode,
+    checkpoint_dir,
+    seconds,
+    budgets,
+    reset=False,
+    tfi=True,
+    window=False,
+    cone=True,
+    order="current",
+):
+    optimizer = load_alg10(
+        mode,
+        checkpoint_dir,
+        seconds,
+        budgets,
+        reset=reset,
+        tfi=tfi,
+        window=window,
+        cone=cone,
+        order=order,
+    )
     orig, _, final, removed, timings = optimizer.solve_circuit(src, out)
     status, _ = verify_equivalence(src, out)
     return {
@@ -75,6 +112,10 @@ def run_case(src, out, mode, checkpoint_dir, seconds, budgets, reset=False, tfi=
         "resumed": timings.get("Checkpoint_Resume", 0),
         "unresolved": timings.get("SAT_Unresolved", 0),
         "tfi_unsat": timings.get("TFI_Query_UNSAT", 0),
+        "window_unsat": timings.get("Window_Query_UNSAT", 0),
+        "window_audit_fail": timings.get("Window_Audit_Fail", 0),
+        "cone_unsat": timings.get("Cone_Query_UNSAT", 0),
+        "cone_checks": timings.get("Cone_Checks", 0),
         "global_unsat": timings.get("Global_Query_UNSAT", 0),
     }
 
@@ -98,6 +139,27 @@ def test_alg10_checkpoint_resume():
         print(f"alg10 fast-save ODC: {fast}")
         assert fast["status"] == "PASS"
         assert fast["final"] < fast["orig"]
+        assert fast["cone_unsat"] > 0
+
+        window_out = os.path.join(tmp, "odc_window_out.aag")
+        window = run_case(
+            odc,
+            window_out,
+            mode="fast_save",
+            checkpoint_dir=checkpoint_dir,
+            seconds=10,
+            budgets="100,1000",
+            reset=True,
+            tfi=False,
+            window=True,
+            cone=False,
+        )
+        print(f"alg10 window-only ODC: {window}")
+        assert window["status"] == "PASS"
+        assert window["final"] < window["orig"]
+        assert window["window_unsat"] > 0
+        assert window["window_audit_fail"] == 0
+        assert window["global_unsat"] == 0
 
         tfi_const = os.path.join(tmp, "tfi_const.aag")
         tfi_out = os.path.join(tmp, "tfi_const_out.aag")

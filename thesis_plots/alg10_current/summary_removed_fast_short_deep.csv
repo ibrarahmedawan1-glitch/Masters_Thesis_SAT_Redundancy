@@ -1,0 +1,22 @@
+Circuit,Profile,Removed
+c432,Fast broad run,4.0
+c6288,Fast broad run,0.0
+c7552,Fast broad run,14.0
+div,Fast broad run,44.0
+log2,Fast broad run,8.0
+sin,Fast broad run,27.0
+sqrt,Fast broad run,36.0
+mem_ctrl,Fast broad run,2.0
+c432,Best clean short ablation,4.0
+c6288,Best clean short ablation,0.0
+c7552,Best clean short ablation,14.0
+sin,Best clean short ablation,39.0
+sqrt,Best clean short ablation,36.0
+c432,Clean deep profile,4.0
+c7552,Clean deep profile,14.0
+c6288,Clean deep profile,0.0
+sin,Clean deep profile,41.0
+sqrt,Clean deep profile,56.0
+div,Clean deep profile,233.0
+log2,Clean deep profile,23.0
+mem_ctrl,Clean deep profile,75.0

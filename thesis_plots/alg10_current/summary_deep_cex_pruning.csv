@@ -1,0 +1,17 @@
+Circuit_Short,CEX pruning type,Candidates
+c432,CEX_Pruned,1086.0
+c7552,CEX_Pruned,11985.0
+c6288,CEX_Pruned,11072.0
+sin,CEX_Pruned,40218.0
+sqrt,CEX_Pruned,120614.0
+div,CEX_Pruned,796002.0
+log2,CEX_Pruned,96539.0
+mem_ctrl,CEX_Pruned,44017.0
+c432,CEX_TFI_Pruned,642.0
+c7552,CEX_TFI_Pruned,6429.0
+c6288,CEX_TFI_Pruned,3521.0
+sin,CEX_TFI_Pruned,31820.0
+sqrt,CEX_TFI_Pruned,146737.0
+div,CEX_TFI_Pruned,790619.0
+log2,CEX_TFI_Pruned,126831.0
+mem_ctrl,CEX_TFI_Pruned,181405.0
