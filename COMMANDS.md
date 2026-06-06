@@ -39,12 +39,17 @@ Algorithm 10 is the checkpointed budget-cycling SAT engine. It has two modes:
 
 - `1`: fast save/checkpoint mode with bounded per-circuit runtime.
 - `2`: deep resume mode with larger budgets and a longer per-circuit runtime.
+- `4`: strict-audit unresolved-to-zero campaign; cycles unresolved circuits using the strict checkpoint directory.
+- `5`: strict audit fast save with SAT assumption audits enabled.
+- `6`: strict audit enhanced deep with SAT assumption audits, CEX pool, pre-sim rejection, and phase-local resume enabled.
 
 Useful non-interactive Algorithm 10 knobs:
 
 ```bash
 ALG10_MODE=fast_save ALG10_MAX_CIRCUIT_SECONDS=60 ALG10_BUDGETS=100,1000,5000 python3 main.py
 ALG10_MODE=deep_resume ALG10_MAX_CIRCUIT_SECONDS=600 ALG10_BUDGETS=1000,5000,20000,100000 python3 main.py
+ALG10_AUDIT_ASSUMPTIONS=1 ALG10_MODE=fast_save ALG10_MAX_CIRCUIT_SECONDS=60 ALG10_BUDGETS=100,1000,5000 python3 main.py
+ALG10_TOTAL_SECONDS=43200 ALG10_RESET_CHECKPOINT=0 ALG10_CHECKPOINT_DIR=results_optimized/alg10_checkpoints_strict_audit python3 main.py
 ```
 
 Checkpoints are written under `results_optimized/alg10_checkpoints/` by default. Set `ALG10_CHECKPOINT_DIR=/path/to/dir` to choose another directory, and `ALG10_RESET_CHECKPOINT=1` to ignore an existing checkpoint.
@@ -52,17 +57,18 @@ Checkpoints are written under `results_optimized/alg10_checkpoints/` by default.
 Algorithm 10 also has sound middle tiers before the full global miter:
 
 ```bash
-ALG10_TFI_CONSTANCY=1 ALG10_TFI_BUDGET=500 ALG10_TFI_MAX_CONE_GATES=2000 python3 main.py
+ALG10_TFI_CONSTANCY=1 ALG10_TFI_ENGINE=persistent ALG10_TFI_SOLVER=cadical153 ALG10_TFI_BUDGET=500 python3 main.py
 ALG10_WINDOW_MITER=1 ALG10_WINDOW_AUDIT=1 ALG10_WINDOW_LEVELS=5 ALG10_WINDOW_BUDGET=500 python3 main.py
-ALG10_CONE_MITER=1 ALG10_CONE_BUDGET=1000 ALG10_CONE_MAX_GATES=5000 python3 main.py
+ALG10_CONE_MITER=1 ALG10_CONE_ENGINE=hybrid ALG10_CONE_SOLVER=cadical153 ALG10_CONE_GROUP_MIN_SIZE=8 ALG10_CONE_BUDGET=1000 ALG10_CONE_MAX_GATES=5000 python3 main.py
 ALG10_CEX_PRUNING=1 python3 main.py
 ```
 
 The normal Algorithm 10 path in `main.py` now defaults to the best tested profile: current ordering, TFI constancy, audited bounded TFO window, exact affected-output cone, global fallback, and CEX pruning. The variables above are still useful when running ablations or intentionally disabling a tier.
+For thesis-critical validation runs, use Alg10 menu option `5` first, then option `6` for deep validation. These presets enable `ALG10_AUDIT_ASSUMPTIONS=1`, which checks global and grouped-cone control assumptions before each SAT call that can accept a candidate. The audit costs some runtime, so long final performance campaigns can use options `3` or `4` after the strict audit presets have passed.
 
-TFI `UNSAT` can commit a stuck-at constant safely. TFI `SAT`, timeout, or skip still escalates to the global miter, so the tier does not remove candidates from coverage.
+TFI `UNSAT` can commit a stuck-at constant safely. The default persistent TFI engine encodes the current good circuit once and reuses one solver for all constancy queries in the phase; set `ALG10_TFI_ENGINE=local` for the old per-candidate cone encoder. TFI `SAT`, timeout, or skip still escalates to the global miter, so the tier does not remove candidates from coverage.
 The bounded TFO window tier is an UNSAT-only over-observable proof: it compares complete fanin cones of nearby fanout boundary roots. With `ALG10_WINDOW_AUDIT=1`, the roots must form a complete observable cut; otherwise the tier skips and escalates. Window `UNSAT` can commit safely only under that complete-cut condition; window `SAT`, timeout, or skip still escalates.
-The cone miter compares only the output/latch-next roots affected by a candidate, but it encodes their complete fanin cone. Cone `UNSAT` can commit safely; cone `SAT`, timeout, or skip still escalates to global SAT.
+The cone miter compares only the output/latch-next roots affected by a candidate, but it encodes their complete fanin cone. Cone `UNSAT` can commit safely; cone `SAT`, timeout, or skip still escalates to global SAT. The hybrid cone engine reuses one configurable cone solver for larger identical affected-root groups and falls back to the original single-candidate cone miter for small groups.
 CEX pruning is rejection-only. TFI CEXs only skip future TFI constancy checks; window/cone/global CEXs prune a candidate only after full-circuit simulation proves that exact candidate creates a real observable mismatch.
 
 Run SAT-side ablation experiments:
@@ -78,6 +84,13 @@ results_optimized/thesis_results_ALG<id>_<timestamp>.csv
 ```
 
 Algorithm 9 and Algorithm 10 reports include the selected mode and profile in both the filename and CSV columns.
+For Algorithm 10, `main.py` also creates a companion chart folder next to each completed CSV, for example:
+
+```text
+results_optimized/thesis_results_ALG10_..._charts/
+```
+
+The folder contains a compact dashboard, top unresolved circuits, tier proof/timeout charts, rejection-only pruning charts, resume-progress charts when checkpoint columns are present, and small summary CSVs. Disable this post-run step with `ALG10_AUTO_PLOTS=0` if you need a raw CSV-only run.
 
 ## Plotting
 
@@ -88,6 +101,11 @@ python3 thesis_plots.py
 ```
 
 Check `thesis_plots/` for generated images.
+Generate the automatic Algorithm 10 chart bundle for an existing CSV:
+
+```bash
+python3 alg10_report_plots.py results_optimized/thesis_results_ALG10_....csv
+```
 
 ## Benchmark Preparation And Demos
 
@@ -96,6 +114,15 @@ Prepare benchmark files:
 ```bash
 python3 prepare_benchmarks.py
 ```
+
+Prepare reusable benchmark suites for the main pipeline:
+
+```bash
+python3 prepare_benchmark_suites.py --epfl-dir epfl_benchmarks
+python3 prepare_benchmark_suites.py --iwls2005-dir benchmark_suites/IWLS_benchmarks_2005_V_1.0
+```
+
+The IWLS command reads the extracted IWLS 2005 `*/netlist/*.v` files plus the included `library/GSCLib_3.0.v`, converts successful designs to ASCII AIGER under `benchmark_suites/iwls2005/`, and writes conversion status to `benchmark_suites/manifest.csv`. `main.py` only loads prepared `.aag` files from `benchmark_suites/`, so raw IWLS folders can sit there safely, but they are not benchmark inputs until this preparation step creates `.aag` files.
 
 Run demo experiments:
 

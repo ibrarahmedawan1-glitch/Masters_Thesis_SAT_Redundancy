@@ -211,6 +211,34 @@ Planted-live benchmark knobs:
 
 Algorithm 1 is the slowest baseline. If `main.py` appears stuck on `alu_8bit.aag` after selecting `1`, that is expected for the naive baseline. Also, pressing `Ctrl+Z` suspends the process rather than stopping it. Use `fg` to resume or `kill %1` to terminate the suspended job.
 
+## 2026-05-27 Alg10 Overnight Status
+
+The Alg10 24h unresolved-to-zero campaign was stopped at the end of the session. Two `python main.py` processes had been observed during the run; the active high-CPU one had already exited, and the remaining low-CPU `python main.py` process was killed manually. A final process check showed no remaining `python main.py` process.
+
+Latest checkpoint family:
+
+- Checkpoint dir: `results_optimized/alg10_checkpoints_resume_pool_presim`
+- Latest run-local dataset marker: `dataset_2026-05-26_03-02-39`
+- Latest checkpoint timestamp: `2026-05-27 00:09:17`
+- Circuits in marker: 38
+- Circuits with nonzero `SAT_Unresolved`: 8
+- Raw latest checkpoint total `SAT_Unresolved`: 475986
+
+Remaining nonzero latest checkpoint rows:
+
+| Circuit | SAT_Unresolved | Status | Latest checkpoint |
+| --- | ---: | --- | --- |
+| `epfl_epfl_arithmetic_hyp.aag` | 428670 | `USER_INTERRUPT_CHECKPOINT` | `2026-05-27 00:09:17` |
+| `epfl_epfl_arithmetic_log2.aag` | 13439 | `TIME_BUDGET_CHECKPOINT` | `2026-05-26 23:15:20` |
+| `epfl_epfl_random_control_arbiter.aag` | 12403 | `TIME_BUDGET_CHECKPOINT` | `2026-05-26 23:35:26` |
+| `epfl_epfl_random_control_mem_ctrl.aag` | 8466 | `TIME_BUDGET_CHECKPOINT` | `2026-05-26 23:45:26` |
+| `epfl_epfl_arithmetic_sqrt.aag` | 7649 | `TIME_BUDGET_CHECKPOINT` | `2026-05-26 23:25:24` |
+| `epfl_epfl_random_control_voter.aag` | 3942 | `TIME_BUDGET_CHECKPOINT` | `2026-05-26 23:55:27` |
+| `epfl_epfl_arithmetic_div.aag` | 1390 | `TIME_BUDGET_CHECKPOINT` | `2026-05-27 00:05:30` |
+| `epfl_epfl_arithmetic_sin.aag` | 27 | `UNRESOLVED_TIMEOUTS` | `2026-05-26 19:28:57` |
+
+Interpretation note: the `hyp` row is a `USER_INTERRUPT_CHECKPOINT`, so its raw unresolved count is an interrupted in-circuit checkpoint and should be interpreted cautiously against previous completed-cycle counts. The last clearly completed checkpoint before that was `div` with 1390 unresolved.
+
 ## Files To Watch
 
 - `main.py`: experiment orchestration, dataset generation, optimizer selection, report writing.
@@ -754,3 +782,766 @@ Pipeline attachment:
   - `ALG10_CEX_PRUNING=1`
 - Fast-save and deep-resume labels now include `cex_window` so CSV files make the profile visible.
 - Environment variables can still override these defaults for ablations.
+
+## 2026-05-19 End-of-Day Closeout: Algorithm 10 CEX Audit, Deep Runs, and Professor Pack
+
+Current thesis framing:
+
+- The work should be presented as a correctness-gated SAT framework for single-gate stuck-at constant redundancy removal on combinational AIG/AAG circuits.
+- Do not claim sequential optimization, optimality, exhaustive redundancy discovery when unresolved candidates remain, or superiority over ABC `fraig`, `dc2`, `dch`, or `resyn2`.
+- Every reported optimization must still end with final ABC combinational equivalence checking (`Verify=PASS`).
+- Safe wording: "verified stuck-at replacement", "tiered SAT proof architecture", "audited bounded-window proofs", "rejection-only CEX pruning", and "complete under the tested budget only when `SAT_Unresolved=0`."
+
+Current Algorithm 10 profile:
+
+- `ALG10_CANDIDATE_ORDER=current`
+- `ALG10_TFI_CONSTANCY=1`
+- `ALG10_WINDOW_MITER=1`
+- `ALG10_WINDOW_AUDIT=1`
+- `ALG10_WINDOW_LEVELS=5`
+- `ALG10_CONE_MITER=1`
+- `ALG10_CEX_PRUNING=1`
+- `ALG10_CEX_PRUNING_BATCH_SIZE=512`
+- Fast mode: `ALG10_MODE=fast_save`, budgets `100,1000,5000`, default 60s/circuit.
+- Deep mode: `ALG10_MODE=deep_resume`, budgets `1000,5000,20000,100000`, default 600s/circuit.
+
+Algorithm explanation for the professor:
+
+- The algorithm tests whether an internal AIG node can be safely replaced by constant 0 or constant 1 without changing real circuit outputs.
+- It first tries cheap SAT proofs and escalates only when needed.
+- Tier 1, TFI constancy: encode the complete transitive fanin of the target and ask if the opposite value is reachable. UNSAT means the node is functionally constant, so the replacement is committed. SAT only means "not TFI-constant"; it does not reject output-level redundancy.
+- Tier 2, bounded TFO window: build a local fanout window and prove that the target fault cannot be observed at the window roots. This tier is accepted only if the runtime audit proves the roots form a complete observable cut from the target to all real observable roots.
+- Tier 3, exact affected-output cone: encode the full affected real output/latch-next cones and compare good vs faulty behavior.
+- Tier 4, full global configurable-fault miter: encode the whole circuit with stuck-at controls and use assumptions to activate only the current candidate plus committed replacements.
+- CEX pruning is rejection-only. It uses SAT counterexamples to eliminate candidates that are demonstrably non-redundant under a concrete PI/latch assignment. It never commits a replacement.
+- CEX recall audit checks the pruning itself: when output-level CEX pruning wants to drop a candidate, audit mode rechecks that exact candidate using the exact observable miter. SAT confirms the prune; UNSAT would mean a false prune and the candidate is kept.
+
+Important correctness clarification:
+
+- Final ABC CEC catches wrong commits, but it cannot catch false pruning because false pruning only misses possible reductions.
+- Therefore the CEX audit is important evidence for pruning quality, not just for output equivalence.
+- TFI-CEX pruning is lower risk because it only skips future TFI-constancy checks; it does not skip the output-redundancy tiers.
+- For circuits with `SAT_Unresolved=0`, the current candidate set was fully classified under this algorithm, candidate ordering, proof tiers, budgets, and stuck-at replacement model. It does not mean globally optimal AIG optimization and it does not rule out non-constant rewrites or ABC-style equivalent-node merging.
+
+CEX audit results:
+
+- `results_optimized/cex_audit_c7552/sat_ablation_2026-05-18_01-53-05.csv`
+  - `c7552`: `1693 -> 1679`, removed 14, `Verify=PASS`.
+  - `CEX_Audit_Checked=5263`, `CEX_Audit_SAT=5263`, `CEX_Audit_False_Prunes=0`, `CEX_Audit_Timeouts=0`.
+  - `SAT_Unresolved=712`, `SAT_Abort_Reason=TIME_BUDGET_CHECKPOINT`.
+  - Interpretation: strong audit evidence for the pruning events completed in this run, but not exhaustive completion because unresolved candidates remain.
+- `results_optimized/cex_audit_sqrt/sat_ablation_2026-05-18_01-55-23.csv`
+  - EPFL `sqrt`: `24618 -> 24618`, removed 0, `Verify=PASS`.
+  - `T_Total=4552.19s`, `T_SAT=3970.33s`.
+  - `CEX_Audit_Checked=6955`, `CEX_Audit_SAT=6923`, `CEX_Audit_False_Prunes=0`, `CEX_Audit_Timeouts=32`.
+  - `SAT_Unresolved=42308`.
+  - Interpretation: no false prunes among completed audits, but full audit on large circuits is too expensive and can starve optimization.
+
+Deep clean results:
+
+- ISCAS deep CSV: `results_optimized/deep_clean_overnight_2026-05-18/sat_ablation_2026-05-18_03-22-57.csv`
+  - `c432`: `125 -> 121`, removed 4, `Verify=PASS`, `SAT_Unresolved=0`.
+  - `c7552`: `1693 -> 1679`, removed 14, `Verify=PASS`, `SAT_Unresolved=0`.
+  - `c6288`: `1870 -> 1870`, removed 0, `Verify=PASS`, `SAT_Unresolved=0`.
+  - Note: this CSV also contains an interrupted `sin` row from a killed run; plots filter to PASS rows.
+- EPFL deep CSV: `results_optimized/deep_clean_overnight_epfl_remaining_run2_2026-05-18/sat_ablation_2026-05-18_03-29-06.csv`
+  - `sin`: `5416 -> 5375`, removed 41, `Verify=PASS`, `TFI_Query_UNSAT=19`, `Window_Query_UNSAT=1`, `SAT_Unresolved=179`.
+  - `sqrt`: `24618 -> 24562`, removed 56, `Verify=PASS`, `Window_Query_UNSAT=22`, `SAT_Unresolved=19747`.
+  - `div`: `57247 -> 57014`, removed 233, `Verify=PASS`, `TFI_Query_UNSAT=8`, `Window_Query_UNSAT=74`, `SAT_Unresolved=21490`.
+  - `log2`: `32060 -> 32037`, removed 23, `Verify=PASS`, `TFI_Query_UNSAT=13`, `SAT_Unresolved=19132`.
+  - `mem_ctrl`: `46836 -> 46761`, removed 75, `Verify=PASS`, `TFI_Query_UNSAT=1`, `Window_Query_UNSAT=34`, `SAT_Unresolved=48193`.
+
+Deep-run interpretation:
+
+- Deep mode found more verified removals than fast/short runs, especially on EPFL circuits:
+  - `sqrt`: 36 -> 56 removals.
+  - `div`: 44 -> 233 removals.
+  - `log2`: 8 -> 23 removals.
+  - `mem_ctrl`: 2 -> 75 removals.
+  - `sin`: 39 -> 41 removals.
+- ISCAS `c432`, `c7552`, and `c6288` are fully resolved under this algorithm and stuck-at model (`SAT_Unresolved=0`).
+- EPFL circuits remain time-budgeted and should not be called exhaustive.
+- The useful tier differs by benchmark: TFI constancy is important for `sin`/`log2`; audited window proofs are important for `sqrt`/`div`/`mem_ctrl`.
+- CEX pruning is now the largest practical accelerator, but the large audit run shows full audit should be used as validation evidence, not the default optimization mode.
+
+Professor meeting pack:
+
+- Directory: `thesis_plots/alg10_current/`
+- Main notes: `thesis_plots/alg10_current/MEETING_NOTES.md`
+- Charts:
+  - `01_removed_fast_short_deep.png`: shows removal improvement from fast/short/deep runs.
+  - `02_deep_tier_commits.png`: shows which SAT proof tier accepted removals.
+  - `03_deep_unresolved.png`: shows coverage/unresolved candidates; use this to be honest about non-exhaustive EPFL runs.
+  - `04_deep_cex_pruning.png`: shows how much candidate space CEX pruning removes.
+  - `05_cex_audit_outcomes.png`: shows audit-confirmed prunes and zero false prunes in the completed audit checks.
+- Summary CSVs:
+  - `summary_removed_fast_short_deep.csv`
+  - `summary_deep_tier_commits.csv`
+  - `summary_deep_unresolved.csv`
+  - `summary_deep_cex_pruning.csv`
+  - `summary_cex_audit.csv`
+
+Suggested meeting story:
+
+- Start with: "Last time the pipeline was correct but still weak on scalability and proof discipline. Since then I added a tiered SAT structure with audited windows and CEX-guided pruning, then validated pruning with a recall audit."
+- Then show `01_removed_fast_short_deep.png`: deep mode finds more verified reductions, especially on EPFL `div`, `sqrt`, and `mem_ctrl`.
+- Then show `02_deep_tier_commits.png`: the contribution is not just more runtime; different proof tiers are useful on different families.
+- Then show `03_deep_unresolved.png`: be clear that ISCAS examples are resolved under the current stuck-at model, while EPFL remains budget-limited.
+- Then show `04_deep_cex_pruning.png`: explain why the approach became fast enough to run.
+- Then show `05_cex_audit_outcomes.png`: explain why CEX pruning is not being trusted blindly.
+
+Checkpoint/resume clarification:
+
+- `sat_ablation_experiments.py` runs are clean ablation rows and currently reset the checkpoint for fairness.
+- Algorithm 10 checkpoints save the last safe optimized circuit, not a precise "resume from candidate number 179" unresolved queue.
+- A resumed optimization starts from the last safe optimized AAG and sweeps again on that circuit. It does not continue exactly from the previous unresolved candidate list.
+- For thesis experiments, use clean runs for fair comparison. For engineering improvement, a future enhancement could store unresolved candidate IDs and continue from them directly.
+
+Potential next steps:
+
+- Before changing the algorithm further, discuss the current evidence with the professor.
+- Strong next experiment after the meeting: add an ABC baseline table with `strash` and `fraig` for the same circuits, reporting AND count and runtime, while clearly explaining that ABC does different transformations.
+- Strong SAT-side improvement idea: improve resume/checkpoint metadata so unresolved candidates can be carried forward exactly.
+- Another SAT-side improvement idea: adaptive tier routing, for example sending high-fanout or window-friendly candidates to the window tier earlier.
+- Future work only: FRAIG/MaxSAT/sequential optimization. These drift away from the current SAT-side thesis scope.
+
+Git state:
+
+- Local commit created: `6bebd97 Add Alg10 CEX audit and deep thesis results`.
+- Commit includes Algorithm 10 code changes, `main.py`, tests, ablation runner, selected CSV result files, professor plots, summaries, prompts/history/session, and run log.
+- Checks before commit:
+  - `git diff --check`: pass.
+  - Python compile check: pass.
+  - `venv/bin/python test_alg10_checkpoint.py`: pass.
+- Push status:
+  - Local branch is ahead of `origin/main` by 1 commit.
+  - `git push origin main` failed because the remote is HTTPS and this terminal could not prompt for GitHub credentials.
+  - SSH also failed because no GitHub SSH key is configured for this machine.
+  - To push later, run `git push origin main` from a terminal with GitHub credentials configured, or configure an SSH key/credential manager first.
+- Untracked scratch files intentionally left out of the commit:
+  - `binary_encoding_test.py`
+  - `sandbox_in_memory.py`
+  - `temp_mod.aag`
+  - `test_binary.aig`
+  - `test_encoding_surgery.py`
+  - `test_python_strash_out.aag`
+  - `test_surgery_out.aag`
+  - `verify_final.py`
+
+## 2026-05-28 Alg10 Strict-Audit SAT Engine Update
+
+Context:
+
+- Goal is still SAT-side stuck-at constant redundancy removal only.
+- Acceptance boundary remains strict: a replacement is committed only after an UNSAT proof in TFI/window/cone/global tier, and final ABC CEC must pass.
+- CEX pool, pre-SAT simulation, and CEX replay remain rejection-only. They never accept redundancy.
+- We cannot tolerate false UNSAT acceptance, stale CNF context, free fault controls, or wrong assumption vectors.
+
+Implemented and tested SAT-engine changes:
+
+- Persistent full-good-circuit TFI constancy solver is now part of Alg10.
+  - For SA0 on gate `g`, query `GoodCNF AND g=1`.
+  - For SA1 on gate `g`, query `GoodCNF AND g=0`.
+  - UNSAT proves functional constancy in the current phase.
+  - Solver is phase-local and rebuilt after physical commit/rebuild.
+- Hybrid grouped exact-cone configurable-fault miter is now part of Alg10.
+  - Groups candidates with identical affected observable root sets.
+  - Uses one configurable cone solver for large groups and falls back to single-candidate cone for small groups.
+  - Production assumption audit is enabled by `ALG10_AUDIT_ASSUMPTIONS=1`.
+- Grouped-cone assumption audit checks:
+  - exact count `2 * len(controls) + 1`;
+  - no duplicates or contradictory assumptions;
+  - every inactive control disabled;
+  - current candidate control activated exactly;
+  - accepted controls activated exactly;
+  - miter literal is final;
+  - full ordered vector equals expected vector.
+- Checkpoint loader was fixed after discovering a branch-selection bug.
+  - Problem: strict-audit `div` had multiple checkpoints for the same source SHA; a newer weaker branch with 173 removed could be loaded instead of an older/better 227/233 branch.
+  - Fix: `_load_checkpoint()` now scans same-basename checkpoints, accepts only exact matching `source_sha256`, validates the work AAG, then chooses best safe checkpoint by lowest current gate count and then lower unresolved.
+  - Future CSVs include `Checkpoint_JSON_Loaded` and `Checkpoint_Work_Loaded`.
+  - `main.py` also prints `Reset checkpoint: 0/1` in the config block.
+- `alg10_report_plots.py` was added.
+  - Alg10 CSVs now get companion chart folders automatically when the run completes.
+  - Generated files include dashboard, reduction/unresolved chart, coverage/runtime chart, rejection-only pruning chart, checkpoint resume progress chart, `summary_by_circuit.csv`, `summary_key_metrics.csv`, and `top_unresolved.csv`.
+- `prepare_benchmark_suites.py` was extended for IWLS2005 Verilog benchmark preparation.
+  - User has extracted IWLS folders under `benchmark_suites/IWLS_benchmarks_2005_V_1.0/`.
+  - Do not convert IWLS while a heavy Alg10 run is active.
+  - Later command:
+    `venv/bin/python prepare_benchmark_suites.py --iwls2005-dir benchmark_suites/IWLS_benchmarks_2005_V_1.0 --yosys-timeout 180`
+
+Soundness/regression checks passed:
+
+- `venv/bin/python test_alg10_grouped_cone_audit.py`
+- `venv/bin/python test_encoding_soundness_bounded.py --max-inputs 2 --max-gates 2 --include-depth3 --progress-interval 0`
+  - PASS on 536,376 candidate checks.
+  - Covered global miter, old TFI, persistent TFI, single cone, grouped cone, audited window, and rewrite semantics against brute force.
+- `venv/bin/python test_alg10_hybrid_safety.py`
+- `venv/bin/python test_alg10_resume_pool.py`
+  - Includes CEX pool replay, stale metadata fallback, phase-local resume, path-change content checkpoint resume, and new best-same-source checkpoint selection regression.
+- `venv/bin/python test_alg10_checkpoint.py`
+- `venv/bin/python test_algorithms_1_to_10.py`
+- `venv/bin/python -m py_compile main.py optimizer_alg10_tiered.py alg10_report_plots.py test_alg10_resume_pool.py`
+- `git diff --check`
+
+Important result history:
+
+- Strict audit fast seed:
+  - CSV: `results_optimized/thesis_results_ALG10_alg10_strict_audit_fast_save_current_real_suites_planted_2026-05-28_00-27-00.csv`
+  - CEC PASS 38/38.
+  - Total removed 619.
+  - Total unresolved 131,863.
+- Strict audit deep run 1:
+  - CSV: `results_optimized/thesis_results_ALG10_alg10_strict_audit_resume_pool_presim_deep_current_real_suites_planted_2026-05-28_00-42-35.csv`
+  - CEC PASS 38/38.
+  - Total removed 1,173.
+  - New removed 554.
+  - Total unresolved 293,918.
+- Strict audit deep run 2:
+  - CSV: `results_optimized/thesis_results_ALG10_alg10_strict_audit_resume_pool_presim_deep_current_real_suites_planted_2026-05-28_02-33-45.csv`
+  - CEC PASS 38/38.
+  - Total removed 1,722.
+  - New removed 549.
+  - Total unresolved 392,706.
+  - This run exposed the confusing `div` checkpoint behavior.
+- Bad/cancelled cold-ish run:
+  - CSV: `results_optimized/thesis_results_ALG10_alg10_strict_audit_resume_pool_presim_deep_current_real_suites_planted_2026-05-28_04-05-36.csv`
+  - `div` had `Checkpoint_Resume=0`, so it started cold and created a weaker 173-removed checkpoint.
+  - Do not use this as final evidence.
+- Latest good strict-audit full run:
+  - CSV: `results_optimized/thesis_results_ALG10_alg10_strict_audit_resume_pool_presim_deep_current_real_suites_planted_2026-05-28_04-34-18.csv`
+  - Charts: `results_optimized/thesis_results_ALG10_alg10_strict_audit_resume_pool_presim_deep_current_real_suites_planted_2026-05-28_04-34-18_charts/`
+  - CEC PASS 38/38.
+  - Total removed 2,130.
+  - New removed 408.
+  - Total unresolved 352,820.
+  - SAT checks 26,923.
+  - UNSAT accepts 119.
+  - Timeouts 3,319.
+  - All 38 rows resumed from checkpoint.
+
+Latest important per-circuit rows from `04-34-18`:
+
+- `div`: removed 233, new 6, unresolved 76,194, checkpoint `epfl_epfl_arithmetic_div_de1d46d85707.json`.
+- `voter`: removed 1,342, new 402, unresolved 2,003, checkpoint `epfl_epfl_random_control_voter_786133f41231.json`.
+- `sin`: removed 41, new 0, unresolved 93.
+- `sqrt`: removed 50, new 0, unresolved 9,140.
+- `log2`: removed 416, new 0, unresolved 13,460.
+- `mem_ctrl`: removed 2, new 0, unresolved 66,264.
+- `hyp`: removed 4, new 0, unresolved 173,217.
+- `arbiter`: removed 0, unresolved 12,449.
+
+Interpretation of latest unresolved counts:
+
+- The total unresolved decreased from the previous full strict-audit branch: 392,706 -> 352,820.
+- This is useful progress, but some per-circuit frontiers can increase after commits/rebuilds because the candidate frontier is regenerated on the new safe AAG.
+- `div` now correctly starts from the 233 branch, not the bad 173 branch.
+- `voter` is the strongest new success: 940 -> 1,342 removed.
+
+Current overnight/cycling setup:
+
+- Menu option 4 was changed to strict-audit cycling:
+  - label: `alg10_strict_audit_zero_resume_pool_presim_current`
+  - `ALG10_REPEAT_UNTIL_ZERO=1`
+  - strict checkpoint directory: `results_optimized/alg10_checkpoints_strict_audit`
+  - assumption audit enabled
+  - CEX pool enabled
+  - pre-SAT rejection enabled
+  - phase-local resume enabled
+  - budgets: `1000,5000,20000,100000,500000`
+- Recommended overnight command:
+  - `ALG10_TOTAL_SECONDS=43200 ALG10_RESET_CHECKPOINT=0 ALG10_CHECKPOINT_DIR=results_optimized/alg10_checkpoints_strict_audit python main.py`
+  - choose `10`, then `4`, then dataset profile `3`, then plants `0`.
+- Before walking away, config should show:
+  - `Mode: alg10_strict_audit_zero_resume_pool_presim_current`
+  - `Total campaign seconds: 43200`
+  - `Repeat unresolved circuits: 1`
+  - `Assumption audit: 1`
+  - `Checkpoint dir: results_optimized/alg10_checkpoints_strict_audit`
+  - `Reset checkpoint: 0`
+
+What to inspect when the campaign finishes:
+
+- Latest CSV total:
+  - CEC PASS count must be all PASS rows.
+  - `Total removed`.
+  - `New_Removed_This_Run`.
+  - `SAT_Unresolved`.
+  - `SAT_Query_UNSAT`.
+  - `SAT_Timeouts`.
+- Per hard circuit:
+  - `div`, `voter`, `sin`, `sqrt`, `log2`, `mem_ctrl`, `hyp`, `arbiter`.
+  - Check `Checkpoint_JSON_Loaded` to confirm the intended checkpoint branch was used.
+  - Check `Checkpoint_Unresolved_Delta`.
+  - Positive delta means unresolved decreased from the loaded checkpoint.
+  - Negative delta usually means new frontier was created after commits/rebuild.
+- The generated chart folder beside the latest CSV should contain:
+  - `01_alg10_dashboard.png`
+  - `02_circuit_reduction_and_unresolved.png`
+  - `03_coverage_and_runtime.png`
+  - `04_rejection_only_pruning.png`
+  - `05_checkpoint_resume_progress.png`
+  - `README.md`
+
+Current working tree notes:
+
+- Modified tracked files include `main.py`, `optimizer_alg10_tiered.py`, `COMMANDS.md`, `SESSION.md`, `prepare_benchmark_suites.py`, and `sat_ablation_experiments.py`.
+- Important untracked files include:
+  - `alg10_report_plots.py`
+  - `test_alg10_grouped_cone_audit.py`
+  - `test_alg10_hybrid_safety.py`
+  - `test_alg10_resume_pool.py`
+  - `test_encoding_soundness_bounded.py`
+  - `sat_cone_group_experiments.py`
+  - `sat_tfi_solver_experiments.py`
+  - `LLM_REVIEW_PROMPT_SAT_ENGINE_SOUNDNESS_AUDIT_2026-05-28.md`
+  - `LLM_REVIEW_PROMPT_SAT_ENGINE_TFI_CONE_2026-05-27.md`
+  - `thesis_plots/alg10_current/ENCODING_SOUNDNESS_ARGUMENT.md`
+  - extracted IWLS raw tree under `benchmark_suites/IWLS_benchmarks_2005_V_1.0/`
+
+## 2026-05-29 Late Session Update
+
+We ran a focused strict-audit near-zero campaign after the May 28 full-suite materialization.
+
+Focused target setup:
+
+- Target folder used:
+  - `custom_circuits/alg10_near_zero_only`
+- Contents:
+  - normalized `epfl_epfl_arithmetic_sin.aag`
+  - normalized `epfl_epfl_random_control_voter.aag`
+- Reason for normalized copies:
+  - The checkpoint `source_sha256` is based on the pipeline-normalized `epfl_epfl_*` files, not the raw `benchmark_suites/epfl/*` files.
+  - A checkpoint lookup patch now scans strict-audit checkpoints by matching `source_sha256`, so custom-target runs can reuse existing best checkpoints even when the filename prefix changes to `custom_`.
+
+Focused campaign command that was run:
+
+```bash
+printf '10\n4\n5\ncustom_circuits/alg10_near_zero_only\n' | \
+ALG10_BUDGETS=500000 \
+ALG10_MAX_CIRCUIT_SECONDS=1800 \
+ALG10_TOTAL_SECONDS=21600 \
+ALG10_RESET_CHECKPOINT=0 \
+ALG10_CHECKPOINT_DIR=results_optimized/alg10_checkpoints_strict_audit \
+venv/bin/python main.py
+```
+
+Focused campaign result:
+
+- CSV:
+  - `results_optimized/thesis_results_ALG10_alg10_strict_audit_zero_resume_pool_presim_current_custom_only_2026-05-28_22-35-35.csv`
+- Charts:
+  - `results_optimized/thesis_results_ALG10_alg10_strict_audit_zero_resume_pool_presim_current_custom_only_2026-05-28_22-35-35_charts/`
+- CEC:
+  - PASS on all 6 campaign rows.
+- Important interpretation:
+  - The printed `SAT unresolved remaining: 166` is a sum across repeated campaign rows and is not the final frontier.
+  - Grouped by latest row per circuit, the real final focused frontier is:
+    - `sin`: removed 41, unresolved 26, coverage 99.76%, CEC PASS.
+    - `voter`: removed 1434, unresolved 22, coverage 99.91%, CEC PASS.
+  - Unique latest focused total:
+    - removed 1475
+    - unresolved 48
+- Main gain:
+  - `voter` improved from removed 1402 / unresolved 87 to removed 1434 / unresolved 22.
+  - This is +32 strict-audit removals and -65 unresolved on `voter`.
+- `sin` improved from unresolved 51 to 26, but removed stayed 41.
+- Both `sin` and `voter` ended in `UNRESOLVED_TIMEOUTS` at the focused budget frontier.
+
+After the focused campaign, we ran a clean full-suite materialization:
+
+```bash
+ALG10_RESET_CHECKPOINT=0 \
+ALG10_CHECKPOINT_DIR=results_optimized/alg10_checkpoints_strict_audit \
+venv/bin/python main.py
+```
+
+Menu choices:
+
+- `10`
+- `6`
+- `3`
+- plants `0`
+
+Latest best full-suite result:
+
+- CSV:
+  - `results_optimized/thesis_results_ALG10_alg10_strict_audit_resume_pool_presim_deep_current_real_suites_planted_2026-05-29_01-02-16.csv`
+- Charts:
+  - `results_optimized/thesis_results_ALG10_alg10_strict_audit_resume_pool_presim_deep_current_real_suites_planted_2026-05-29_01-02-16_charts/`
+- CEC:
+  - 38/38 PASS.
+- Total removed:
+  - 2222 gates.
+- Previous clean full-suite total removed:
+  - 2190 gates.
+- Improvement:
+  - +32 gates, from the focused `voter` campaign.
+- SAT unresolved:
+  - 102521.
+- Previous clean full-suite unresolved:
+  - 102522.
+- SAT checks:
+  - 8367, down from 9054.
+- SAT timeouts:
+  - 1121, down from 1446.
+
+Important latest full-suite per-circuit rows:
+
+- `epfl_epfl_random_control_voter.aag`
+  - removed 1434
+  - unresolved 22
+  - coverage 99.91%
+  - abort `UNRESOLVED_TIMEOUTS`
+  - global exhausted 22
+  - CEC PASS
+- `epfl_epfl_arithmetic_sin.aag`
+  - removed 41
+  - unresolved 26
+  - coverage 99.76%
+  - abort `UNRESOLVED_TIMEOUTS`
+  - global exhausted 26
+  - CEC PASS
+- `epfl_epfl_arithmetic_div.aag`
+  - removed 233
+  - unresolved 1732
+  - coverage 98.48%
+  - CEC PASS
+- `epfl_epfl_arithmetic_sqrt.aag`
+  - removed 50
+  - unresolved 9020
+  - coverage 81.64%
+  - CEC PASS
+- `epfl_epfl_arithmetic_log2.aag`
+  - removed 416
+  - unresolved 13154
+  - coverage 79.22%
+  - CEC PASS
+- `epfl_epfl_random_control_mem_ctrl.aag`
+  - removed 2
+  - unresolved 66177
+  - coverage 29.35%
+  - CEC PASS
+- `epfl_epfl_random_control_arbiter.aag`
+  - removed 0
+  - unresolved 12209
+  - coverage 48.44%
+  - CEC PASS
+- `epfl_epfl_arithmetic_hyp.aag`
+  - removed 4
+  - unresolved 181
+  - coverage 99.96%
+  - CEC PASS
+
+Current interpretation:
+
+- The latest full-suite result is the current best thesis-ready strict-audit report.
+- The near-zero capstone circuits are now:
+  - `voter`: 99.91% coverage, 22 unresolved.
+  - `sin`: 99.76% coverage, 26 unresolved.
+- Repeating the same deep mode is probably low value now because `sin` and `voter` hit `UNRESOLVED_TIMEOUTS` at the current frontier.
+- More SAT budget alone is unlikely to help much unless we either:
+  - raise budgets substantially for a final focused attempt, or
+  - improve scheduling/frontier persistence.
+
+Recommended next engineering discussion:
+
+1. Add completion/exhaustion-aware skipping:
+   - If a checkpoint has `unresolved=0`, skip SAT entirely and only materialize/verify.
+   - If a checkpoint/candidate is already exhausted at the same budget policy, do not retry the same cone/window/global budget path.
+2. Persist per-tier exhaustion, not only global budget history:
+   - The remaining bottleneck after the focused run is not purely global SAT.
+   - The focused run reported cone-tier as the main timeout bottleneck.
+   - The clean full-suite still has many repeated frontier checks.
+3. Consider a new SAT-only candidate ordering experiment:
+   - PO-to-PI / reverse-topological.
+   - Dominator-first where structurally meaningful.
+   - Goal: expose more redundant dominators early and make downstream candidates easier by BCP.
+4. For finding more redundancies after a circuit reaches `SAT_Unresolved=0`:
+   - More SAT on the same candidate queue cannot find more in the same stuck-at constant model.
+   - To expose new candidates, we need a new phase after commits/cleanup/strash, then regenerate candidates and run SAT again to a fixpoint.
+   - This must stay strict: only UNSAT accepts, CEX rejection-only, final ABC CEC PASS.
+
+Next session reminder:
+
+- First, read this `SESSION.md`.
+- Remind the user:
+  - The latest best full-suite CSV is `results_optimized/thesis_results_ALG10_alg10_strict_audit_resume_pool_presim_deep_current_real_suites_planted_2026-05-29_01-02-16.csv`.
+  - Current best total removed is 2222 gates with 38/38 CEC PASS.
+  - `voter` is the best capstone: 1434 removed, 22 unresolved, 99.91% coverage.
+  - `sin` is also near complete: 41 removed, 26 unresolved, 99.76% coverage.
+  - The next sensible work is not another identical run, but efficiency/frontier improvements: completion/exhaustion-aware skip, per-tier budget persistence, and possibly candidate ordering.
+
+## 2026-06-03 Pre-SAT Rejection Recheck
+
+After a few-day pause, we rechecked the opt-in Algorithm 10 pre-SAT simulation
+rejection path against the non-pre-sim CEX-window profile. The acceptance
+boundary is unchanged: pre-SAT simulation is rejection-only and never commits a
+replacement.
+
+Regression checks:
+
+- `venv/bin/python -m py_compile main.py optimizer_alg10_tiered.py sat_ablation_experiments.py probe_alg10_presat_sim.py`
+- `venv/bin/python test_alg10_checkpoint.py`
+- Capped audit smoke:
+  `venv/bin/python sat_ablation_experiments.py --circuits benchmarks/c432.aag --variants presim_cex_window_audit_capped --seconds 5 --budgets 100,1000 --output-dir /tmp/alg10_presim_audit_recheck`
+  - `c432`: 125 -> 121, removed 4, `Verify=PASS`
+  - `CEX_Audit_Checked=708`
+  - `CEX_Audit_False_Prunes=0`
+
+Quick 20s comparison:
+
+- CSV: `/tmp/alg10_presim_recheck_quick/sat_ablation_2026-06-03_20-02-34.csv`
+- `c432`: same 4 removals and PASS; pre-sim reduced SAT checks 208 -> 11 and SAT time 0.064s -> 0.006s.
+- `c7552`: same 14 removals and PASS; pre-sim reduced SAT checks 1709 -> 790 and SAT time 1.53s -> 0.96s.
+- `sin`: same 39 removals and PASS; pre-sim reduced SAT checks 1246 -> 1014 and SAT time 10.88s -> 9.63s, but worsened `SAT_Unresolved` 8 -> 86 in this short budget.
+
+Hard 30s deep-style comparison:
+
+- CSV: `/tmp/alg10_presim_recheck_hard30/sat_ablation_2026-06-03_20-03-36.csv`
+- `sqrt`: same 44 removals and PASS; pre-sim improved unresolved 20389 -> 13123 and coverage 58.52% -> 73.30%, but SAT time rose 3.32s -> 3.98s.
+- `log2`: same 416 removals and PASS; pre-sim reduced SAT time 29.58s -> 16.81s, but unresolved rose slightly 136 -> 159.
+- `div`: same 44 removals and PASS; pre-sim improved unresolved 86372 -> 5032, coverage 24.50% -> 95.60%, and SAT time 15.98s -> 13.68s.
+- `mem_ctrl`: same 0 removals and PASS; pre-sim reduced SAT time 29.78s -> 20.07s, but unresolved rose 5639 -> 6517.
+
+Decision:
+
+- Keep pre-SAT rejection. It is sound as rejection-only, improves several
+  important cases dramatically (`div`, `sqrt`) and reduces SAT time on many
+  rows without reducing removals or breaking CEC.
+- Do not claim it universally dominates. In short fixed budgets it can worsen
+  unresolved on some circuits (`sin`, `log2`, `mem_ctrl`) because pre-sim uses
+  wall-clock time that might otherwise classify late candidates through SAT/CEX.
+- Current `main.py` structure is appropriate: pre-sim remains enabled in the
+  enhanced/strict Alg10 modes (`3`, `4`, `6`), while the plain deep CEX-window
+  mode (`2`) remains available as the non-pre-sim comparison.
+- Next improvement should be adaptive pre-sim/tier scheduling rather than
+  removing pre-sim: cap or skip pre-sim when prior CEX pruning is already near
+  completion, and spend more pre-sim budget on circuits like `div` where it
+  sharply reduces unresolved.
+
+Reviewer prompt prepared after this decision:
+
+- `LLM_REVIEW_PROMPT_STRICT_SAT_MORE_REDUNDANCIES_2026-06-03.md`
+- Use Prompt A to ask for SAT-engine changes that prove more redundancies and
+  more removals.
+- Use Prompt B to ask a separate reviewer to attack soundness: fault masking,
+  stale CNF, bad assumptions, incomplete observable roots, and checkpoint
+  invalidation.
+- Only implement a suggestion if it includes proof obligations, audit
+  invariants, negative tests, bounded exhaustive tests, and an experiment
+  matrix.
+
+## 2026-06-03 Strict SAT Feedback Implementation Screen
+
+After reviewing four external-feedback responses, the strongest actionable
+feedback was not a new acceptance proof tier. It was stricter phase-local
+frontier continuation and exhaustion-aware scheduling. The other recurring
+idea, audited dominator/cut windows, was implemented only as an opt-in
+experiment because it changes local SAT root selection and can easily become a
+performance trap.
+
+Implemented:
+
+- Added `ALG10_EXACT_FRONTIER_RESUME=1`.
+  - Only applies when a checkpoint contains a valid same-work-AAG global
+    frontier.
+  - Validation still requires checkpoint work SHA and gate count match.
+  - When active, it skips already-completed lower tiers and resumes the global
+    frontier directly.
+  - It does not introduce any new acceptance rule.
+  - Main Alg10 modes `3`, `4`, and `6` now enable it by default.
+- Added exact-frontier telemetry:
+  - `Exact_Frontier_Resume_Enabled`
+  - `Exact_Frontier_Resume_Used`
+  - `Exact_Frontier_Resume_Candidates`
+  - `Exact_Frontier_Skipped_Lower_Tiers`
+- Added `ALG10_WINDOW_ROOT_STRATEGY` with values:
+  - `bounded`: existing default.
+  - `dominator`: use only audited single-root TFO cuts.
+  - `hybrid`: try an audited dominator root first; if inconclusive, fall back
+    to the existing audited bounded window.
+- Added dominator-window telemetry:
+  - `Window_Root_Strategy`
+  - `Window_Dominator_Attempts`
+  - `Window_Dominator_Used`
+  - `Window_Dominator_Fallbacks`
+
+Important soundness boundary:
+
+- Exact-frontier resume is scheduling only. It reuses no stale solver and no
+  stale candidate metadata unless the work AAG hash and gate count match.
+- Dominator windows remain UNSAT-only and runtime-audited. The complete-cut
+  audit still gates every window acceptance.
+- Hybrid dominator falls back to bounded windows when the dominator root is
+  SAT, timeout, skipped, or audit-failed. This matters because a fault visible
+  at a dominator root may still be masked downstream.
+
+Focused checks passed:
+
+- `venv/bin/python -m py_compile optimizer_alg10_tiered.py main.py sat_ablation_experiments.py test_alg10_checkpoint.py test_alg10_resume_pool.py test_encoding_soundness_bounded.py`
+- `venv/bin/python test_alg10_checkpoint.py`
+  - Added hybrid-dominator ODC smoke: removed 2, `Verify=PASS`,
+    `Window_Dominator_Used > 0`, `Window_Audit_Fail=0`.
+- `venv/bin/python test_alg10_resume_pool.py`
+  - Added exact-frontier resume smoke: valid global frontier resumed,
+    `Exact_Frontier_Resume_Used=1`, lower tiers skipped in the one-phase check,
+    final CEC `PASS`.
+- `venv/bin/python test_alg10_grouped_cone_audit.py`
+- `venv/bin/python test_alg10_hybrid_safety.py`
+- `venv/bin/python test_algorithms_1_to_10.py`
+- `env ALG10_WINDOW_ROOT_STRATEGY=hybrid venv/bin/python test_encoding_soundness_bounded.py --max-inputs 2 --max-gates 2 --progress-interval 0`
+  - PASS on 37,416 candidate checks.
+- `env ALG10_WINDOW_ROOT_STRATEGY=hybrid venv/bin/python test_encoding_soundness_bounded.py --max-inputs 2 --max-gates 2 --include-depth3 --progress-interval 0`
+  - PASS on 536,376 candidate checks.
+- `git diff --check`
+
+Ablation results:
+
+- Revised hybrid dominator screen:
+  - CSV: `/tmp/alg10_hybrid_dominator_window_screen2/sat_ablation_2026-06-03_20-51-28.csv`
+  - `c432`: bounded and hybrid both removed 4, CEC PASS; bounded was faster.
+  - `c7552`: bounded and hybrid both removed 14, CEC PASS; bounded was faster.
+  - `sin`: both removed 39, CEC PASS; hybrid reduced SAT time but worsened
+    unresolved in this short budget.
+- Hard 30s deep-style screen:
+  - CSV: `/tmp/alg10_hybrid_dominator_hard30/sat_ablation_2026-06-03_20-52-43.csv`
+  - `sqrt`: both removed 44, CEC PASS; hybrid was slightly cheaper but had
+    slightly worse unresolved.
+  - `log2`: both removed 416, CEC PASS; hybrid was effectively neutral.
+  - `div`: both removed 44, CEC PASS; hybrid was effectively neutral.
+  - `mem_ctrl`: both removed 0, CEC PASS; hybrid was neutral.
+
+Decision:
+
+- Keep `ALG10_EXACT_FRONTIER_RESUME=1` in enhanced/strict modes. This is a
+  conservative scheduling improvement and is directly aligned with the strongest
+  feedback.
+- Keep dominator/hybrid window code as an opt-in experimental strategy only.
+  It passed soundness screens, but it did not find more removals in the short
+  A/B matrices and can worsen unresolved/time. Do not promote it to default.
+- Next high-value work should continue along feedback-2 lines:
+  - exact per-tier frontier persistence with explicit escalated-vs-remaining
+    candidate sets;
+  - per-tier exhaustion history, not only global budget history;
+  - adaptive scheduling that avoids repeated lower-tier work without relying on
+    stale candidate IDs after rebuild.
+
+2026-06-03 follow-up: implemented and tested the feedback-2 per-tier frontier
+slice.
+
+What changed:
+
+- Added exact tier-frontier checkpoint schema `alg10_tier_frontier_v1` for
+  `tfi`, `window`, and `cone`.
+- A tier frontier stores explicit `pending` and `escalated` candidate lists.
+  Validation still requires the checkpoint work AAG SHA and gate count to match.
+- Exact resume can now restart from:
+  - TFI pending, then continue window/cone/global from the merged escalated set.
+  - Window pending, skipping TFI for that resumed phase.
+  - Cone pending, skipping TFI and window for that resumed phase.
+- Fixed telemetry so a fresh tier handoff into global is not counted as
+  `Phase_Local_Resume_Used`; only a valid checkpoint frontier is counted.
+- Added `Exact_Frontier_Resume_Tier` telemetry.
+
+Focused resume comparison on `benchmarks/c432.aag`:
+
+- TFI late frontier seed: exact resume used tier `tfi`, CEC PASS, 52 SAT checks
+  vs 75 without exact tier resume in a one-phase comparison.
+- Window frontier seed: exact resume used tier `window`, CEC PASS, 28 checks vs
+  75 without exact tier resume; TFI checks were 0 in the resumed phase.
+- Cone frontier seed: exact resume used tier `cone`, CEC PASS, 35 checks vs 75
+  without exact tier resume; TFI/window checks were 0 in the resumed phase.
+
+Checks passed after this slice:
+
+- `venv/bin/python -m py_compile optimizer_alg10_tiered.py main.py sat_ablation_experiments.py test_alg10_resume_pool.py test_alg10_checkpoint.py test_encoding_soundness_bounded.py`
+- `venv/bin/python test_alg10_resume_pool.py`
+- `venv/bin/python test_alg10_checkpoint.py`
+- `venv/bin/python test_alg10_hybrid_safety.py`
+- `venv/bin/python test_alg10_grouped_cone_audit.py`
+- `env ALG10_WINDOW_ROOT_STRATEGY=hybrid venv/bin/python test_encoding_soundness_bounded.py --max-inputs 2 --max-gates 2 --progress-interval 0`
+  - PASS on 37,416 candidate checks.
+- `env ALG10_WINDOW_ROOT_STRATEGY=hybrid venv/bin/python test_encoding_soundness_bounded.py --max-inputs 2 --max-gates 2 --include-depth3 --progress-interval 0`
+  - PASS on 536,376 candidate checks.
+- `venv/bin/python test_algorithms_1_to_10.py`
+- `git diff --check`
+
+Decision:
+
+- Keep the per-tier exact frontier implementation. It is scheduling-only, does
+  not add a new acceptance rule, and the strict checks found no encoding or CEC
+  regression.
+- Do not claim it improves fresh one-shot runs; it helps interrupted/resumed SAT
+  campaigns by avoiding repeated already-completed lower-tier work.
+
+## 2026-06-05 Scheduling Patch Screen From Prompt A/B Feedback
+
+We tried the next low-risk scheduling ideas without changing the SAT acceptance
+boundary. All attempted changes remain UNSAT-only for commits; CEX and pre-sim
+remain rejection-only.
+
+Added opt-in ablation knobs/variants:
+
+- fair CEX-enabled ordering variants: `cex_window_reverse`,
+  `cex_window_cone_size`;
+- fair rebuild-cadence variants: `cex_window_rebuild25_current`,
+  `cex_window_rebuild25_reverse`;
+- adaptive pre-sim stop:
+  - `ALG10_PRE_SIM_ADAPTIVE=1`;
+  - `ALG10_PRE_SIM_ADAPTIVE_MIN_RANDOM_PRUNED`;
+  - `ALG10_PRE_SIM_ADAPTIVE_MIN_RANDOM_FRACTION`;
+  - `ALG10_PRE_SIM_ADAPTIVE_RANDOM_PATIENCE`;
+- post-TFI pre-sim scheduling:
+  - `ALG10_PRE_SIM_AFTER_TFI=1`, which runs TFI first and applies pre-sim only
+    to TFI-escalated candidates.
+
+Safety checks passed:
+
+- `venv/bin/python -m py_compile optimizer_alg10_tiered.py main.py sat_ablation_experiments.py`
+- `venv/bin/python test_alg10_checkpoint.py`
+- `venv/bin/python test_alg10_resume_pool.py`
+- `venv/bin/python test_alg10_hybrid_safety.py`
+- `venv/bin/python test_alg10_grouped_cone_audit.py`
+- `env ALG10_PRE_SIM_ADAPTIVE=1 ALG10_WINDOW_ROOT_STRATEGY=hybrid venv/bin/python test_encoding_soundness_bounded.py --max-inputs 2 --max-gates 2 --progress-interval 0`
+  - PASS on 37,416 candidate checks.
+- `env ALG10_PRE_SIM_REJECTION=1 ALG10_PRE_SIM_AFTER_TFI=1 ALG10_WINDOW_ROOT_STRATEGY=hybrid venv/bin/python test_encoding_soundness_bounded.py --max-inputs 2 --max-gates 2 --progress-interval 0`
+  - PASS on 37,416 candidate checks.
+- `venv/bin/python test_algorithms_1_to_10.py`
+- `git diff --check`
+
+Ablation files:
+
+- Fair ordering screen:
+  `/tmp/alg10_cex_order_screen/sat_ablation_2026-06-05_21-38-08.csv`
+- Rebuild cadence screen:
+  `/tmp/alg10_rebuild25_screen/sat_ablation_2026-06-05_21-43-28.csv`
+- Adaptive pre-sim quick:
+  `/tmp/alg10_adaptive_presim_quick/sat_ablation_2026-06-05_21-47-24.csv`
+- Adaptive pre-sim hard:
+  `/tmp/alg10_adaptive_presim_hard25/sat_ablation_2026-06-05_21-48-52.csv`
+- Post-TFI pre-sim hard:
+  `/tmp/alg10_post_tfi_presim_hard25/sat_ablation_2026-06-05_21-57-04.csv`
+
+Results and decision:
+
+- CEX-enabled reverse/cone ordering did not increase removals. Current ordering
+  remains the best default.
+- Rebuild-after-25 was neutral on c432/c7552/sin and did not justify changing
+  the default `REBUILD_AFTER_COMMITS=100`.
+- Adaptive pre-sim was mixed:
+  - helped runtime on some rows;
+  - did not rescue `log2`;
+  - missed a `sqrt` removal that fixed pre-sim found in one hard 25s run.
+- Post-TFI pre-sim preserved `log2`'s 416 removals, while fixed pre-sim dropped
+  to about 263 in the hard 25s run. But post-TFI lost the fixed pre-sim runtime
+  and unresolved-count benefit on `div`/`mem_ctrl`.
+
+Do not promote adaptive pre-sim or post-TFI pre-sim to the main strict/default
+Alg10 modes yet. Keep them as opt-in experiment knobs. The data suggests
+circuit-specific profiles:
+
+- `div`, `sqrt`, and sometimes `mem_ctrl`: pre-sim before TFI can reduce
+  unresolved/runtime and sometimes expose a small number of extra removals.
+- `log2`: avoid pre-sim before TFI; use no pre-sim or post-TFI pre-sim so the
+  TFI proof tier gets the wall-clock budget.

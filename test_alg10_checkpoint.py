@@ -60,6 +60,7 @@ def load_alg10(
     window=False,
     cone=True,
     order="current",
+    window_strategy="bounded",
 ):
     sys.modules.pop("optimizer_alg10_tiered", None)
     os.environ["ALG10_MODE"] = mode
@@ -71,6 +72,7 @@ def load_alg10(
     os.environ["ALG10_WINDOW_MITER"] = "1" if window else "0"
     os.environ["ALG10_WINDOW_AUDIT"] = "1"
     os.environ["ALG10_WINDOW_LEVELS"] = "5"
+    os.environ["ALG10_WINDOW_ROOT_STRATEGY"] = window_strategy
     os.environ["ALG10_CONE_MITER"] = "1" if cone else "0"
     os.environ["ALG10_CANDIDATE_ORDER"] = order
     return importlib.import_module("optimizer_alg10_tiered")
@@ -88,6 +90,7 @@ def run_case(
     window=False,
     cone=True,
     order="current",
+    window_strategy="bounded",
 ):
     optimizer = load_alg10(
         mode,
@@ -99,6 +102,7 @@ def run_case(
         window=window,
         cone=cone,
         order=order,
+        window_strategy=window_strategy,
     )
     orig, _, final, removed, timings = optimizer.solve_circuit(src, out)
     status, _ = verify_equivalence(src, out)
@@ -114,6 +118,9 @@ def run_case(
         "tfi_unsat": timings.get("TFI_Query_UNSAT", 0),
         "window_unsat": timings.get("Window_Query_UNSAT", 0),
         "window_audit_fail": timings.get("Window_Audit_Fail", 0),
+        "window_strategy": timings.get("Window_Root_Strategy", ""),
+        "window_dominator_used": timings.get("Window_Dominator_Used", 0),
+        "window_dominator_fallbacks": timings.get("Window_Dominator_Fallbacks", 0),
         "cone_unsat": timings.get("Cone_Query_UNSAT", 0),
         "cone_checks": timings.get("Cone_Checks", 0),
         "global_unsat": timings.get("Global_Query_UNSAT", 0),
@@ -160,6 +167,27 @@ def test_alg10_checkpoint_resume():
         assert window["window_unsat"] > 0
         assert window["window_audit_fail"] == 0
         assert window["global_unsat"] == 0
+
+        dom_window_out = os.path.join(tmp, "odc_dominator_window_out.aag")
+        dom_window = run_case(
+            odc,
+            dom_window_out,
+            mode="fast_save",
+            checkpoint_dir=checkpoint_dir,
+            seconds=10,
+            budgets="100,1000",
+            reset=True,
+            tfi=False,
+            window=True,
+            cone=False,
+            window_strategy="hybrid",
+        )
+        print(f"alg10 hybrid-dominator window ODC: {dom_window}")
+        assert dom_window["status"] == "PASS"
+        assert dom_window["final"] < dom_window["orig"]
+        assert dom_window["window_unsat"] > 0
+        assert dom_window["window_audit_fail"] == 0
+        assert dom_window["window_dominator_used"] > 0
 
         tfi_const = os.path.join(tmp, "tfi_const.aag")
         tfi_out = os.path.join(tmp, "tfi_const_out.aag")

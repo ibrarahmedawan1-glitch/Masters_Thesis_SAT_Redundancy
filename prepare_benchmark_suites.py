@@ -9,7 +9,8 @@ benchmarks.
 
 Supported inputs:
 - local EPFL `.aig` files under `epfl_benchmarks/`;
-- optional external directories containing `.aig` or `.aag` files.
+- IWLS 2005 mapped Verilog netlists;
+- optional external directories containing `.aig`, `.aag`, `.v`, or `.blif` files.
 """
 
 import argparse
@@ -84,7 +85,60 @@ def _prepare_aag(source, target, force=False):
     return "ERROR", "copied file is not valid aag"
 
 
-def _prepare_verilog(source, target, force=False):
+def _prepare_verilog(
+    source,
+    target,
+    force=False,
+    library_files=None,
+    include_dirs=None,
+    top=None,
+    timeout=180,
+):
+    if os.path.exists(target) and not force:
+        return "OK", "already exists"
+    if shutil.which("yosys") is None:
+        return "ERROR", "yosys not found"
+
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    log_path = target + ".log"
+    read_parts = []
+    include_opt = " ".join(f"-I{shlex.quote(path)}" for path in (include_dirs or []))
+    for lib in library_files or []:
+        read_parts.append(f"read_verilog -sv {include_opt} {shlex.quote(lib)}")
+    read_parts.append(f"read_verilog -sv {include_opt} {shlex.quote(source)}")
+    hierarchy = f"hierarchy -check -top {shlex.quote(top)}" if top else "hierarchy -check -auto-top"
+    script = "; ".join(
+        read_parts
+        + [
+            hierarchy,
+            "proc",
+            "opt",
+            "flatten",
+            "opt",
+            "techmap",
+            "opt",
+            "abc -g AND",
+            f"write_aiger -ascii {shlex.quote(target)}",
+        ]
+    )
+    with open(log_path, "w", encoding="utf-8") as log:
+        try:
+            result = subprocess.run(
+                ["yosys", "-p", script],
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return "ERROR", f"yosys timed out; see {log_path}"
+    if result.returncode != 0:
+        return "ERROR", f"yosys failed; see {log_path}"
+    if normalize_aag_symbols(target, comment="Prepared Verilog benchmark suite"):
+        return "OK", "synthesized verilog to aag"
+    return "ERROR", "yosys output is not valid aag"
+
+
+def _prepare_blif(source, target, force=False, timeout=180):
     if os.path.exists(target) and not force:
         return "OK", "already exists"
     if shutil.which("yosys") is None:
@@ -93,20 +147,24 @@ def _prepare_verilog(source, target, force=False):
     os.makedirs(os.path.dirname(target), exist_ok=True)
     log_path = target + ".log"
     script = (
-        f"read_verilog {shlex.quote(source)}; "
-        "hierarchy -auto-top; proc; opt; techmap; abc -g AND; "
+        f"read_blif {shlex.quote(source)}; "
+        "hierarchy -check -auto-top; proc; opt; techmap; opt; abc -g AND; "
         f"write_aiger -ascii {shlex.quote(target)}"
     )
     with open(log_path, "w", encoding="utf-8") as log:
-        result = subprocess.run(
-            ["yosys", "-p", script],
-            stdout=log,
-            stderr=subprocess.STDOUT,
-        )
+        try:
+            result = subprocess.run(
+                ["yosys", "-p", script],
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return "ERROR", f"yosys timed out; see {log_path}"
     if result.returncode != 0:
         return "ERROR", f"yosys failed; see {log_path}"
-    if normalize_aag_symbols(target, comment="Prepared Verilog benchmark suite"):
-        return "OK", "synthesized verilog to aag"
+    if normalize_aag_symbols(target, comment="Prepared BLIF benchmark suite"):
+        return "OK", "converted blif to aag"
     return "ERROR", "yosys output is not valid aag"
 
 
@@ -128,6 +186,49 @@ def prepare_epfl(epfl_dir, out_dir, force=False):
     return rows
 
 
+def prepare_iwls2005(iwls_dir, out_dir, force=False, timeout=180):
+    rows = []
+    if not iwls_dir or not os.path.exists(iwls_dir):
+        return rows
+
+    library = os.path.join(iwls_dir, "library", "GSCLib_3.0.v")
+    library_files = [library] if os.path.exists(library) else []
+    include_dirs = [os.path.dirname(library)] if library_files else []
+
+    for family in ("faraday", "itc99", "gaisler", "opencores", "iscas"):
+        netlist_dir = os.path.join(iwls_dir, family, "netlist")
+        if not os.path.isdir(netlist_dir):
+            continue
+        for filename in sorted(os.listdir(netlist_dir)):
+            if not filename.endswith(".v"):
+                continue
+            source = os.path.join(netlist_dir, filename)
+            target_name = f"iwls2005_{family}_{_safe_name(filename)}.aag"
+            target = os.path.join(out_dir, "iwls2005", target_name)
+            status, note = _prepare_verilog(
+                source,
+                target,
+                force=force,
+                library_files=library_files,
+                include_dirs=include_dirs,
+                timeout=timeout,
+            )
+            _record(rows, "IWLS2005", source, target, status, note)
+
+    blif_dir = os.path.join(iwls_dir, "iscas", "blif")
+    if os.path.isdir(blif_dir):
+        for filename in sorted(os.listdir(blif_dir)):
+            if not filename.endswith(".blif"):
+                continue
+            source = os.path.join(blif_dir, filename)
+            target_name = f"iwls2005_iscas_blif_{_safe_name(filename)}.aag"
+            target = os.path.join(out_dir, "iwls2005", target_name)
+            status, note = _prepare_blif(source, target, force=force, timeout=timeout)
+            _record(rows, "IWLS2005", source, target, status, note)
+
+    return rows
+
+
 def prepare_external(extra_dirs, out_dir, force=False):
     rows = []
     for extra_dir in extra_dirs:
@@ -137,7 +238,12 @@ def prepare_external(extra_dirs, out_dir, force=False):
             rel = os.path.relpath(root, extra_dir)
             prefix = "" if rel == "." else rel.replace(os.sep, "_") + "_"
             for filename in sorted(files):
-                if not (filename.endswith(".aig") or filename.endswith(".aag") or filename.endswith(".v")):
+                if not (
+                    filename.endswith(".aig")
+                    or filename.endswith(".aag")
+                    or filename.endswith(".v")
+                    or filename.endswith(".blif")
+                ):
                     continue
                 source = os.path.join(root, filename)
                 target_name = f"external_{prefix}{_safe_name(filename)}.aag"
@@ -146,6 +252,8 @@ def prepare_external(extra_dirs, out_dir, force=False):
                     status, note = _prepare_aig(source, target, force=force)
                 elif filename.endswith(".v"):
                     status, note = _prepare_verilog(source, target, force=force)
+                elif filename.endswith(".blif"):
+                    status, note = _prepare_blif(source, target, force=force)
                 else:
                     status, note = _prepare_aag(source, target, force=force)
                 _record(rows, "External", source, target, status, note)
@@ -178,13 +286,23 @@ def write_manifest(rows, out_dir):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--epfl-dir", default=DEFAULT_EPFL_DIR)
+    parser.add_argument("--iwls2005-dir", default="")
     parser.add_argument("--out-dir", default=DEFAULT_OUT_DIR)
     parser.add_argument("--extra-src", action="append", default=[], help="additional directory with .aig/.aag files")
+    parser.add_argument("--yosys-timeout", type=int, default=180)
     parser.add_argument("--force", action="store_true", help="re-convert files even if target exists")
     args = parser.parse_args()
 
     rows = []
     rows.extend(prepare_epfl(args.epfl_dir, args.out_dir, force=args.force))
+    rows.extend(
+        prepare_iwls2005(
+            args.iwls2005_dir,
+            args.out_dir,
+            force=args.force,
+            timeout=args.yosys_timeout,
+        )
+    )
     rows.extend(prepare_external(args.extra_src, args.out_dir, force=args.force))
     manifest = write_manifest(rows, args.out_dir)
 
