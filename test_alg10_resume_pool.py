@@ -32,6 +32,9 @@ ALG10_ENV = [
     "ALG10_COMMIT_UNITS",
     "ALG10_CHECKPOINT_DIR",
     "ALG10_RESET_CHECKPOINT",
+    "ALG10_CHECKPOINT_SELECT",
+    "ALG10_EXTRA_CHECKPOINT_DIRS",
+    "ALG10_PROTECT_BEST_CHECKPOINT",
     "ALG10_TFI_CONSTANCY",
     "ALG10_TFI_BUDGET",
     "ALG10_TFI_MAX_CONE_GATES",
@@ -111,6 +114,8 @@ def run_case(src, out, checkpoint_dir, **env):
         "checks": timings.get("SAT_Checks", 0),
         "resumed": timings.get("Checkpoint_Resume", 0),
         "checkpoint_status": timings.get("Checkpoint_Status_Loaded", ""),
+        "checkpoint_source_dir": timings.get("Checkpoint_Source_Dir", ""),
+        "checkpoint_imported_external": timings.get("Checkpoint_Imported_External", 0),
         "checkpoint_start_and2": timings.get("Checkpoint_Start_AND2", ""),
         "checkpoint_start_removed": timings.get("Checkpoint_Start_Removed_AND2", ""),
         "new_removed": timings.get("New_Removed_This_Run", ""),
@@ -163,6 +168,110 @@ def load_checkpoint_json(checkpoint_dir):
         return json.load(f)
 
 
+def write_odc_reduced_circuit(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="ascii") as f:
+        f.write("aag 2 2 0 1 0\n")
+        f.write("2\n")
+        f.write("4\n")
+        f.write("2\n")
+        f.write("i0 x\n")
+        f.write("i1 y\n")
+        f.write("o0 out\n")
+        f.write("c\n")
+        f.write("Reduced ODC equivalent: out = x\n")
+
+
+def test_checkpoint_save_preserves_best_unresolved_active_branch():
+    with tempfile.TemporaryDirectory(prefix="alg10_protect_unres_") as tmp:
+        ckpt = os.path.join(tmp, "ckpt")
+        src = os.path.join(tmp, "odc.aag")
+        reduced = os.path.join(tmp, "odc_reduced.aag")
+        write_odc_redundant_circuit(src)
+        write_odc_reduced_circuit(reduced)
+
+        optimizer = load_alg10(
+            ALG10_CHECKPOINT_DIR=ckpt,
+            ALG10_RESET_CHECKPOINT="0",
+            ALG10_CHECKPOINT_SELECT="unresolved",
+            ALG10_PROTECT_BEST_CHECKPOINT="1",
+        )
+        optimizer._save_checkpoint(src, src, {"unresolved": 5}, "TIME_BUDGET_CHECKPOINT")
+        optimizer._save_checkpoint(src, reduced, {"unresolved": 99}, "TIME_BUDGET_CHECKPOINT")
+
+        data = load_checkpoint_json(ckpt)
+        loaded = optimizer._load_checkpoint(src)
+        print(f"protected unresolved checkpoint: {data}")
+        assert data["current_gates"] == 2
+        assert data["telemetry"]["unresolved"] == 5
+        assert loaded["current_gates"] == 2
+        assert loaded["telemetry"]["unresolved"] == 5
+
+
+def test_checkpoint_save_allows_lower_gate_branch_under_gate_policy():
+    with tempfile.TemporaryDirectory(prefix="alg10_protect_gates_") as tmp:
+        ckpt = os.path.join(tmp, "ckpt")
+        src = os.path.join(tmp, "odc.aag")
+        reduced = os.path.join(tmp, "odc_reduced.aag")
+        write_odc_redundant_circuit(src)
+        write_odc_reduced_circuit(reduced)
+
+        optimizer = load_alg10(
+            ALG10_CHECKPOINT_DIR=ckpt,
+            ALG10_RESET_CHECKPOINT="0",
+            ALG10_CHECKPOINT_SELECT="gates",
+            ALG10_PROTECT_BEST_CHECKPOINT="1",
+        )
+        optimizer._save_checkpoint(src, src, {"unresolved": 5}, "TIME_BUDGET_CHECKPOINT")
+        optimizer._save_checkpoint(src, reduced, {"unresolved": 99}, "TIME_BUDGET_CHECKPOINT")
+
+        data = load_checkpoint_json(ckpt)
+        loaded = optimizer._load_checkpoint(src)
+        print(f"protected gates checkpoint: {data}")
+        assert data["current_gates"] == 0
+        assert data["telemetry"]["unresolved"] == 99
+        assert loaded["current_gates"] == 0
+
+
+def test_checkpoint_save_does_not_shadow_better_external_seed():
+    with tempfile.TemporaryDirectory(prefix="alg10_protect_external_") as tmp:
+        active = os.path.join(tmp, "active")
+        external = os.path.join(tmp, "external")
+        src = os.path.join(tmp, "odc.aag")
+        reduced = os.path.join(tmp, "odc_reduced.aag")
+        write_odc_redundant_circuit(src)
+        write_odc_reduced_circuit(reduced)
+
+        external_optimizer = load_alg10(
+            ALG10_CHECKPOINT_DIR=external,
+            ALG10_RESET_CHECKPOINT="0",
+            ALG10_CHECKPOINT_SELECT="unresolved",
+            ALG10_PROTECT_BEST_CHECKPOINT="1",
+        )
+        external_optimizer._save_checkpoint(src, src, {"unresolved": 3}, "TIME_BUDGET_CHECKPOINT")
+
+        active_optimizer = load_alg10(
+            ALG10_CHECKPOINT_DIR=active,
+            ALG10_EXTRA_CHECKPOINT_DIRS=external,
+            ALG10_RESET_CHECKPOINT="0",
+            ALG10_CHECKPOINT_SELECT="unresolved",
+            ALG10_PROTECT_BEST_CHECKPOINT="1",
+        )
+        returned = active_optimizer._save_checkpoint(
+            src, reduced, {"unresolved": 100}, "TIME_BUDGET_CHECKPOINT"
+        )
+        loaded = active_optimizer._load_checkpoint(src)
+        active_jsons = [
+            path
+            for path in glob.glob(os.path.join(active, "*.json"))
+            if not path.endswith(".cex.json")
+        ]
+        print(f"external protected checkpoint returned={returned} loaded={loaded}")
+        assert not active_jsons
+        assert loaded["telemetry"]["unresolved"] == 3
+        assert loaded["_checkpoint_imported_external"] == 1
+
+
 def test_cex_pool_persist_and_replay():
     with tempfile.TemporaryDirectory(prefix="alg10_pool_") as tmp:
         ckpt = os.path.join(tmp, "ckpt")
@@ -184,6 +293,13 @@ def test_cex_pool_persist_and_replay():
         assert seed["pool_saved"] > 0
         assert seed["pool_added"] > 0
         assert seed["presim_pruned"] > 0
+        seed_path = checkpoint_json(ckpt)
+        with open(seed_path, "r", encoding="utf-8") as f:
+            seed_data = json.load(f)
+        seed_data["status"] = "TIME_BUDGET_CHECKPOINT"
+        seed_data.setdefault("telemetry", {})["unresolved"] = max(1, seed["fault_total"] // 2)
+        with open(seed_path, "w", encoding="utf-8") as f:
+            json.dump(seed_data, f, indent=2, sort_keys=True)
 
         replay_out = os.path.join(tmp, "c432_replay.aag")
         replay = run_case(
@@ -295,10 +411,11 @@ def test_phase_local_resume_valid_and_stale_fallback():
         assert stale_run["resumed"] == 1
         assert stale_run["phase_used"] == 0
 
+        phase_ckpt = os.path.join(tmp, "ckpt_phase")
         partial = run_case(
             c432,
             partial_out,
-            ckpt,
+            phase_ckpt,
             ALG10_RESET_CHECKPOINT="1",
             ALG10_TFI_CONSTANCY="0",
             ALG10_WINDOW_MITER="0",
@@ -315,7 +432,7 @@ def test_phase_local_resume_valid_and_stale_fallback():
         resumed = run_case(
             c432,
             resumed_out,
-            ckpt,
+            phase_ckpt,
             ALG10_RESET_CHECKPOINT="0",
             ALG10_TFI_CONSTANCY="0",
             ALG10_WINDOW_MITER="0",
@@ -329,6 +446,117 @@ def test_phase_local_resume_valid_and_stale_fallback():
         print(f"phase valid resume: {resumed}")
         assert resumed["resumed"] == 1
         assert resumed["phase_used"] == 1
+
+
+def test_external_checkpoint_preserves_valid_phase_resume():
+    with tempfile.TemporaryDirectory(prefix="alg10_external_phase_") as tmp:
+        external_ckpt = os.path.join(tmp, "external")
+        active_ckpt = os.path.join(tmp, "active")
+        c432 = "benchmarks/c432.aag"
+
+        seed = run_case(
+            c432,
+            os.path.join(tmp, "seed.aag"),
+            external_ckpt,
+            ALG10_RESET_CHECKPOINT="1",
+            ALG10_TFI_CONSTANCY="0",
+            ALG10_WINDOW_MITER="0",
+            ALG10_CONE_MITER="0",
+            ALG10_GLOBAL_MITER="1",
+            ALG10_PHASE_LOCAL_RESUME="1",
+            ALG10_MAX_CIRCUIT_SECONDS="0.01",
+            ALG10_BUDGETS="1",
+            ALG10_CEX_PRUNING="0",
+        )
+        print(f"external phase seed: {seed}")
+        assert seed["phase_saved"] == 1
+
+        resumed = run_case(
+            c432,
+            os.path.join(tmp, "resumed.aag"),
+            active_ckpt,
+            ALG10_RESET_CHECKPOINT="0",
+            ALG10_EXTRA_CHECKPOINT_DIRS=external_ckpt,
+            ALG10_TFI_CONSTANCY="1",
+            ALG10_WINDOW_MITER="1",
+            ALG10_CONE_MITER="1",
+            ALG10_GLOBAL_MITER="1",
+            ALG10_PHASE_LOCAL_RESUME="1",
+            ALG10_EXACT_FRONTIER_RESUME="1",
+            ALG10_MAX_PHASES="1",
+            ALG10_MAX_CIRCUIT_SECONDS="10",
+            ALG10_BUDGETS="100,1000",
+            ALG10_CEX_PRUNING="1",
+        )
+        print(f"external phase resume: {resumed}")
+        assert resumed["resumed"] == 1
+        assert resumed["checkpoint_imported_external"] == 1
+        assert resumed["phase_used"] == 1
+        assert resumed["exact_frontier_used"] == 1
+
+
+def test_checkpoint_rank_counts_tier_pending_and_escalated():
+    optimizer = load_alg10(
+        ALG10_CHECKPOINT_SELECT="unresolved",
+        ALG10_PHASE_LOCAL_RESUME="1",
+    )
+    data = {
+        "current_gates": 0,
+        "timestamp": 0,
+        "telemetry": {"unresolved": 1},
+        "phase_resume": {
+            "schema": "alg10_tier_frontier_v1",
+            "tier": "cone",
+            "pending": [[0, 0]],
+            "escalated": [[1, 0], [2, 1]],
+        },
+    }
+    rank = optimizer._checkpoint_rank_from_data(data, "benchmarks/c432.aag")
+    assert rank[0] == 3
+
+
+def test_tier_frontier_overlap_and_duplicates_are_rejected():
+    optimizer = load_alg10(ALG10_PHASE_LOCAL_RESUME="1")
+    c432 = "benchmarks/c432.aag"
+    gate_count = optimizer.parse_aag(c432)[4]
+    base = {
+        "schema": "alg10_tier_frontier_v1",
+        "tier": "window",
+        "work_sha256": optimizer._sha256_file(c432),
+        "gate_count": gate_count,
+        "pending": [[0, 0]],
+        "escalated": [[0, 0]],
+    }
+    assert optimizer._valid_phase_resume_state(base, c432, gate_count) is None
+
+    duplicate = dict(base)
+    duplicate["pending"] = [[0, 0], [0, 0]]
+    duplicate["escalated"] = []
+    assert optimizer._valid_phase_resume_state(duplicate, c432, gate_count) is None
+
+    global_duplicate = {
+        "schema": "alg10_global_frontier_v1",
+        "tier": "global",
+        "work_sha256": optimizer._sha256_file(c432),
+        "gate_count": gate_count,
+        "candidates": [[0, 0, 1000], [0, 0, 5000]],
+    }
+    assert optimizer._valid_phase_resume_state(global_duplicate, c432, gate_count) is None
+
+
+def test_untried_first_global_frontier_order():
+    optimizer = load_alg10(ALG10_GLOBAL_FRONTIER_ORDER="untried_first")
+    gates_raw = optimizer.parse_aag("benchmarks/c432.aag")[8]
+    candidates = [(0, 0), (1, 0), (2, 0), (3, 0)]
+    ordered = optimizer._order_global_frontier(
+        candidates,
+        gates_raw,
+        {
+            (0, 0): 1000,
+            (2, 0): 5000,
+        },
+    )
+    assert ordered == [(1, 0), (3, 0), (0, 0), (2, 0)]
 
 
 def test_exact_frontier_resume_skips_completed_lower_tiers():
@@ -631,6 +859,10 @@ def run_all():
     test_cex_pool_persist_and_replay()
     test_cex_pool_stale_metadata_is_ignored()
     test_phase_local_resume_valid_and_stale_fallback()
+    test_external_checkpoint_preserves_valid_phase_resume()
+    test_checkpoint_rank_counts_tier_pending_and_escalated()
+    test_tier_frontier_overlap_and_duplicates_are_rejected()
+    test_untried_first_global_frontier_order()
     test_exact_frontier_resume_skips_completed_lower_tiers()
     test_exact_frontier_resume_for_tfi_window_and_cone()
     test_rebuild_checkpoint_drops_phase_resume()

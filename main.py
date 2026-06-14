@@ -135,9 +135,24 @@ def print_alg10_diagnostic_summary(header, rows):
     if not alg_rows:
         return
 
-    total_removed = sum(_csv_int(get(row, "Gates_Removed")) for row in alg_rows)
+    by_circuit = {}
+    for row in alg_rows:
+        by_circuit.setdefault(get(row, "Circuit"), []).append(row)
+    latest_rows = [circuit_rows[-1] for circuit_rows in by_circuit.values()]
+    best_unresolved_rows = [
+        min(circuit_rows, key=lambda row: _csv_int(get(row, "SAT_Unresolved")))
+        for circuit_rows in by_circuit.values()
+    ]
+    best_gate_rows = [
+        max(circuit_rows, key=lambda row: _csv_int(get(row, "Gates_Removed")))
+        for circuit_rows in by_circuit.values()
+    ]
+
+    total_removed = sum(_csv_int(get(row, "Gates_Removed")) for row in latest_rows)
+    total_removed_best_gate = sum(_csv_int(get(row, "Gates_Removed")) for row in best_gate_rows)
     total_new_removed = sum(_csv_int(get(row, "New_Removed_This_Run")) for row in alg_rows)
-    total_unresolved = sum(_csv_int(get(row, "SAT_Unresolved")) for row in alg_rows)
+    total_unresolved = sum(_csv_int(get(row, "SAT_Unresolved")) for row in latest_rows)
+    total_unresolved_best = sum(_csv_int(get(row, "SAT_Unresolved")) for row in best_unresolved_rows)
     total_timeouts = sum(_csv_int(get(row, "SAT_Timeouts")) for row in alg_rows)
     total_checks = sum(_csv_int(get(row, "SAT_Checks")) for row in alg_rows)
     total_sat = sum(_csv_int(get(row, "SAT_Query_SAT")) for row in alg_rows)
@@ -149,13 +164,21 @@ def print_alg10_diagnostic_summary(header, rows):
     budget_skipped = sum(_csv_int(get(row, "Global_Budget_History_Skipped")) for row in alg_rows)
     budget_exhausted = sum(_csv_int(get(row, "Global_Budget_History_Exhausted")) for row in alg_rows)
     cec_pass = sum(1 for row in alg_rows if get(row, "Verify") == "PASS")
+    latest_cec_pass = sum(1 for row in latest_rows if get(row, "Verify") == "PASS")
 
     print("\n[Alg10 diagnostic summary]")
-    print(f"    CEC PASS: {cec_pass}/{len(alg_rows)}")
-    print(f"    Total removed: {total_removed} gates")
+    print(f"    CEC PASS rows: {cec_pass}/{len(alg_rows)}")
+    print(f"    CEC PASS latest circuits: {latest_cec_pass}/{len(latest_rows)}")
+    if len(alg_rows) != len(latest_rows):
+        print(f"    Repeated campaign rows: {len(alg_rows)} rows over {len(latest_rows)} circuits")
+    print(f"    Total removed latest circuits: {total_removed} gates")
+    if total_removed_best_gate != total_removed:
+        print(f"    Best gate-reduction seen: {total_removed_best_gate} gates")
     if total_new_removed:
-        print(f"    New removed this run from checkpoints: {total_new_removed} gates")
-    print(f"    SAT unresolved remaining: {total_unresolved}")
+        print(f"    New removed events this run from checkpoints: {total_new_removed} gates")
+    print(f"    SAT unresolved latest circuits: {total_unresolved}")
+    if total_unresolved_best != total_unresolved:
+        print(f"    Best SAT unresolved seen: {total_unresolved_best}")
     print(
         f"    SAT calls: {total_checks} checks | {total_sat} SAT rejects | "
         f"{total_unsat} UNSAT accepts | {total_timeouts} timeouts"
@@ -189,22 +212,30 @@ def print_alg10_diagnostic_summary(header, rows):
                 get(row, "SAT_Abort_Reason"),
                 get(row, "Fault_Coverage_Lower_Bound%"),
                 _csv_int(get(row, "Global_Budget_History_Exhausted")),
+                _csv_int(get(best_row, "SAT_Unresolved")),
             )
-            for row in alg_rows
+            for row, best_row in (
+                (
+                    circuit_rows[-1],
+                    min(circuit_rows, key=lambda candidate: _csv_int(get(candidate, "SAT_Unresolved"))),
+                )
+                for circuit_rows in by_circuit.values()
+            )
         ),
         reverse=True,
     )
     top = [item for item in unresolved_rows if item[0] > 0][:8]
     if top:
-        print("    Top unresolved circuits:")
-        for unresolved, circuit, removed, new_removed, abort, coverage, exhausted in top:
+        print("    Top unresolved latest circuits:")
+        for unresolved, circuit, removed, new_removed, abort, coverage, exhausted, best_unresolved in top:
             extra = f", exhausted={exhausted}" if exhausted else ""
+            best = f", best_seen={best_unresolved}" if best_unresolved != unresolved else ""
             print(
                 f"      {circuit}: unresolved={unresolved}, removed={removed}, "
-                f"new={new_removed}, coverage={coverage}, abort={abort}{extra}"
+                f"new={new_removed}, coverage={coverage}, abort={abort}{best}{extra}"
             )
     else:
-        print("    No unresolved candidates remain in this run.")
+        print("    No unresolved candidates remain in the latest circuit rows.")
 
     if budget_exhausted:
         print("    Next action hint: increase global budgets or improve cone/window SAT for exhausted candidates.")
@@ -641,6 +672,9 @@ def configure_algorithm10_run():
     print(f"    Cone miter: {os.environ.get('ALG10_CONE_MITER', '1')}")
     print(f"    Cone engine: {os.environ.get('ALG10_CONE_ENGINE', 'hybrid')}")
     print(f"    Cone solver: {os.environ.get('ALG10_CONE_SOLVER', 'cadical153')}")
+    print(f"    Global solver: {os.environ.get('ALG10_GLOBAL_SOLVER', 'glucose4')}")
+    print(f"    Global frontier order: {os.environ.get('ALG10_GLOBAL_FRONTIER_ORDER', 'current')}")
+    print(f"    Global phase mode: {os.environ.get('ALG10_GLOBAL_PHASE_MODE', 'none')}")
     print(f"    CEX pruning: {os.environ.get('ALG10_CEX_PRUNING', '0')}")
     print(f"    CEX pool: {os.environ.get('ALG10_CEX_POOL', '0')}")
     print(f"    Pre-SAT rejection: {os.environ.get('ALG10_PRE_SIM_REJECTION', '0')}")
@@ -649,6 +683,8 @@ def configure_algorithm10_run():
     print(f"    Assumption audit: {os.environ.get('ALG10_AUDIT_ASSUMPTIONS', '0')}")
     print(f"    CEX audit: {os.environ.get('ALG10_AUDIT_CEX_PRUNING', '0')}")
     print(f"    Checkpoint dir: {os.environ.get('ALG10_CHECKPOINT_DIR', 'results_optimized/alg10_checkpoints')}")
+    print(f"    Extra checkpoint dirs: {os.environ.get('ALG10_EXTRA_CHECKPOINT_DIRS', '')}")
+    print(f"    Checkpoint select policy: {os.environ.get('ALG10_CHECKPOINT_SELECT', 'gates')}")
     print(f"    Reset checkpoint: {os.environ.get('ALG10_RESET_CHECKPOINT', '0')}")
     if INCLUDE_CUSTOM_CIRCUITS:
         print(f"    Custom circuit path: {CUSTOM_CIRCUIT_PATH}")
@@ -687,7 +723,7 @@ def select_optimizer():
     return mapping[choice], choice
 
 if __name__ == "__main__":
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    timestamp = os.environ.get("THESIS_RUN_TIMESTAMP") or datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     configure_run_directories(timestamp)
     setup_directories()
     
@@ -880,6 +916,9 @@ if __name__ == "__main__":
                 timings.get("Checkpoint_Status_Loaded", ""),
                 timings.get("Checkpoint_JSON_Loaded", ""),
                 timings.get("Checkpoint_Work_Loaded", ""),
+                timings.get("Checkpoint_Source_Dir", ""),
+                timings.get("Checkpoint_Imported_External", ""),
+                timings.get("Checkpoint_Select_Policy", ""),
                 timings.get("Checkpoint_Start_AND2", ""),
                 timings.get("Checkpoint_Start_Removed_AND2", ""),
                 timings.get("New_Removed_This_Run", ""),
@@ -898,7 +937,32 @@ if __name__ == "__main__":
                 timings.get("Cone_Checks", ""), timings.get("Cone_Query_SAT", ""),
                 timings.get("Cone_Query_UNSAT", ""), timings.get("Cone_Timeouts", ""),
                 timings.get("Cone_Skipped", ""),
-                timings.get("Global_Checks", ""), timings.get("Global_Query_SAT", ""),
+                timings.get("Cone_Engine", ""),
+                timings.get("Cone_Solver", ""),
+                timings.get("Cone_Group_Min_Size", ""),
+                timings.get("Cone_Partition_Size", ""),
+                timings.get("Cone_Partition_Min_Roots", ""),
+                timings.get("Cone_Partition_Max_Gates", ""),
+                timings.get("Cone_Partition_Checks", ""),
+                timings.get("Cone_Partition_Query_SAT", ""),
+                timings.get("Cone_Partition_Query_UNSAT", ""),
+                timings.get("Cone_Partition_Timeouts", ""),
+                timings.get("Cone_Partition_Groups", ""),
+                timings.get("Cone_Partition_Audit_Fail", ""),
+                timings.get("Cone_Partition_Skipped", ""),
+                timings.get("Cone_Partition_No_Affected", ""),
+                timings.get("Cone_Partition_Below_Min_Roots", ""),
+                timings.get("Cone_Partition_Target_Outside_Cone", ""),
+                timings.get("Cone_Partition_Cone_Too_Large", ""),
+                timings.get("Cone_Partition_Fallbacks", ""),
+                timings.get("Cone_Partition_Max_Seen_Cone_Gates", ""),
+                timings.get("Cone_Partition_Max_Skipped_Cone_Gates", ""),
+                timings.get("Global_Checks", ""), timings.get("Global_Solver", ""),
+                timings.get("Global_Max_Consecutive_Timeouts", ""),
+                timings.get("Global_Frontier_Order", ""),
+                timings.get("Global_Phase_Mode", ""),
+                timings.get("Global_Phase_Model_Limit", ""),
+                timings.get("Global_Query_SAT", ""),
                 timings.get("Global_Query_UNSAT", ""), timings.get("Global_Timeouts", ""),
                 timings.get("Global_Budget_History_Loaded", ""),
                 timings.get("Global_Budget_History_Skipped", ""),
@@ -916,7 +980,8 @@ if __name__ == "__main__":
                 timings.get("CEX_Pool_Saved", ""), timings.get("CEX_Pool_Size", ""),
                 timings.get("CEX_Pool_Added", ""), timings.get("CEX_Pool_Replay_Patterns", ""),
                 timings.get("CEX_Pool_Replay_Checked", ""), timings.get("CEX_Pool_Replay_Pruned", ""),
-                timings.get("PreSAT_Sim_Enabled", ""), timings.get("PreSAT_Sim_After_TFI", ""),
+                timings.get("PreSAT_Sim_Enabled", ""), timings.get("PreSAT_Sim_Engine", ""),
+                timings.get("PreSAT_Sim_Packed_Max_Bits", ""), timings.get("PreSAT_Sim_After_TFI", ""),
                 timings.get("PreSAT_Sim_Patterns", ""),
                 timings.get("PreSAT_Sim_Checked", ""), timings.get("PreSAT_Sim_Pruned", ""),
                 timings.get("PreSAT_Sim_Structured_Pruned", ""),
@@ -938,6 +1003,11 @@ if __name__ == "__main__":
                 timings.get("Fault_Detection_Events_By_CEX_Pool", ""),
                 timings.get("Fault_Detection_Events_By_CEX_Prune", ""),
                 timings.get("Fault_Redundancy_Proof_Events_UNSAT", ""),
+                timings.get("Functional_Const_Proofs_TFI", ""),
+                timings.get("Exact_Miter_UNSAT_Proofs_Window", ""),
+                timings.get("Exact_Miter_UNSAT_Proofs_Cone", ""),
+                timings.get("Exact_Miter_UNSAT_Proofs_Global", ""),
+                timings.get("Exact_Miter_UNSAT_Proofs_Total", ""),
                 status
             ])
             if repeat_until_zero:
@@ -975,6 +1045,11 @@ if __name__ == "__main__":
                 "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
                 "", "", "", "", "", "", "", "", "", "", "", "", "ERROR"
             ])
+            if repeat_until_zero:
+                latest_unresolved_by_path[f_path] = max(
+                    1, _csv_int(latest_unresolved_by_path.get(f_path, 1))
+                )
+                stalled_paths.add(f_path)
 
     report_header = [
         "Circuit", "Type", "Run_Mode", "Dataset_Profile",
@@ -989,6 +1064,7 @@ if __name__ == "__main__":
         "SAT_Accepted_SA0", "SAT_Accepted_SA1", "Rebuilds",
         "SAT_Unresolved", "SAT_Max_Budget", "Checkpoint_Resume",
         "Checkpoint_Status_Loaded", "Checkpoint_JSON_Loaded", "Checkpoint_Work_Loaded",
+        "Checkpoint_Source_Dir", "Checkpoint_Imported_External", "Checkpoint_Select_Policy",
         "Checkpoint_Start_AND2",
         "Checkpoint_Start_Removed_AND2", "New_Removed_This_Run",
         "Checkpoint_Start_Unresolved", "Checkpoint_Unresolved_Delta",
@@ -998,7 +1074,20 @@ if __name__ == "__main__":
         "Window_Root_Strategy", "Window_Dominator_Attempts", "Window_Dominator_Used",
         "Window_Dominator_Fallbacks",
         "Cone_Checks", "Cone_Query_SAT", "Cone_Query_UNSAT", "Cone_Timeouts", "Cone_Skipped",
-        "Global_Checks", "Global_Query_SAT", "Global_Query_UNSAT", "Global_Timeouts",
+        "Cone_Engine", "Cone_Solver", "Cone_Group_Min_Size",
+        "Cone_Partition_Size", "Cone_Partition_Min_Roots", "Cone_Partition_Max_Gates",
+        "Cone_Partition_Checks",
+        "Cone_Partition_Query_SAT", "Cone_Partition_Query_UNSAT",
+        "Cone_Partition_Timeouts", "Cone_Partition_Groups",
+        "Cone_Partition_Audit_Fail",
+        "Cone_Partition_Skipped", "Cone_Partition_No_Affected",
+        "Cone_Partition_Below_Min_Roots", "Cone_Partition_Target_Outside_Cone",
+        "Cone_Partition_Cone_Too_Large", "Cone_Partition_Fallbacks",
+        "Cone_Partition_Max_Seen_Cone_Gates",
+        "Cone_Partition_Max_Skipped_Cone_Gates",
+        "Global_Checks", "Global_Solver", "Global_Max_Consecutive_Timeouts",
+        "Global_Frontier_Order", "Global_Phase_Mode", "Global_Phase_Model_Limit",
+        "Global_Query_SAT", "Global_Query_UNSAT", "Global_Timeouts",
         "Global_Budget_History_Loaded", "Global_Budget_History_Skipped",
         "Global_Budget_History_Exhausted",
         "Phase_Local_Resume_Enabled", "Phase_Local_Resume_Used",
@@ -1009,7 +1098,8 @@ if __name__ == "__main__":
         "CEX_Pool_Enabled", "CEX_Pool_Loaded", "CEX_Pool_Saved", "CEX_Pool_Size",
         "CEX_Pool_Added", "CEX_Pool_Replay_Patterns", "CEX_Pool_Replay_Checked",
         "CEX_Pool_Replay_Pruned",
-        "PreSAT_Sim_Enabled", "PreSAT_Sim_After_TFI", "PreSAT_Sim_Patterns", "PreSAT_Sim_Checked",
+        "PreSAT_Sim_Enabled", "PreSAT_Sim_Engine", "PreSAT_Sim_Packed_Max_Bits",
+        "PreSAT_Sim_After_TFI", "PreSAT_Sim_Patterns", "PreSAT_Sim_Checked",
         "PreSAT_Sim_Pruned", "PreSAT_Sim_Structured_Pruned",
         "PreSAT_Sim_Random_Pruned", "PreSAT_Sim_Time", "PreSAT_Sim_Adaptive_Stop",
         "CEX_Prune_Events", "CEX_Prune_Checked", "CEX_Pruned",
@@ -1022,6 +1112,9 @@ if __name__ == "__main__":
         "Fault_Coverage_Lower_Bound%", "Fault_Detection_Events_By_PreSim",
         "Fault_Detection_Events_By_CEX_Pool", "Fault_Detection_Events_By_CEX_Prune",
         "Fault_Redundancy_Proof_Events_UNSAT",
+        "Functional_Const_Proofs_TFI", "Exact_Miter_UNSAT_Proofs_Window",
+        "Exact_Miter_UNSAT_Proofs_Cone", "Exact_Miter_UNSAT_Proofs_Global",
+        "Exact_Miter_UNSAT_Proofs_Total",
         "Verify"
     ]
 

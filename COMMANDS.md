@@ -53,6 +53,14 @@ ALG10_TOTAL_SECONDS=43200 ALG10_RESET_CHECKPOINT=0 ALG10_CHECKPOINT_DIR=results_
 ```
 
 Checkpoints are written under `results_optimized/alg10_checkpoints/` by default. Set `ALG10_CHECKPOINT_DIR=/path/to/dir` to choose another directory, and `ALG10_RESET_CHECKPOINT=1` to ignore an existing checkpoint.
+To seed a campaign from the best known checkpoints in other experiment
+families, set `ALG10_EXTRA_CHECKPOINT_DIRS` to a comma-separated list. Matching
+still requires the same source SHA, and imported checkpoints use only the safe
+`.work.aag`; stale phase-frontier metadata from the other directory is ignored.
+Use `ALG10_CHECKPOINT_SELECT=gates` for lowest-gate seeds, or
+`ALG10_CHECKPOINT_SELECT=unresolved` for unresolved-to-zero campaigns.
+`ALG10_PROTECT_BEST_CHECKPOINT=1` is enabled by default; it prevents a later
+cycle from overwriting a better matching checkpoint under the selected policy.
 
 Algorithm 10 also has sound middle tiers before the full global miter:
 
@@ -91,6 +99,34 @@ results_optimized/thesis_results_ALG10_..._charts/
 ```
 
 The folder contains a compact dashboard, top unresolved circuits, tier proof/timeout charts, rejection-only pruning charts, resume-progress charts when checkpoint columns are present, and small summary CSVs. Disable this post-run step with `ALG10_AUTO_PLOTS=0` if you need a raw CSV-only run.
+
+## ABC Baseline Comparison
+
+Run ABC-only synthesis flows on the latest Algorithm 10 dataset and compare the
+area/depth/runtime/CEC metrics against the latest Alg10 CSV:
+
+```bash
+python3 abc_baseline_runner.py
+```
+
+Default flows are `strash`, `dc2`, `dch`, `fraig`, `resyn2`, and `resyn2x2`.
+The runner writes detailed, summary-by-flow, and best-by-circuit CSVs under:
+
+```text
+results_optimized/abc_baselines/<timestamp>/
+```
+
+Run a smaller smoke or focused comparison:
+
+```bash
+python3 abc_baseline_runner.py --input benchmarks/c432.aag --flows strash,dc2,dch,fraig,resyn2
+python3 abc_baseline_runner.py --input results_optimized/datasets/dataset_2026-06-08_19-21-02 --flows dc2,resyn2
+python3 abc_baseline_runner.py --max-circuits 3 --flows strash,dc2
+```
+
+This is an external context baseline, not a replacement for the SAT pipeline:
+ABC flows can perform broader logic synthesis than stuck-at constant redundancy
+removal. Still require `Verify=PASS` before using a row in thesis comparisons.
 
 ## Plotting
 
@@ -132,6 +168,212 @@ python3 run_bench_demo.py
 python3 demos/run_normalization_demo.py
 ```
 
+## Partitioned Exact Miter Experiment
+
+Compare the current monolithic exact cone miter with affected-root partitions:
+
+```bash
+venv/bin/python partitioned_miter_experiment.py --circuits benchmarks/c7552.aag benchmark_suites/epfl/epfl_arithmetic_sin.aag --partition-sizes 1,2,4,8 --budget 5000 --max-candidates 200 --scan-limit 10000 --seconds 60 --min-affected-roots 2 --classify-tfi
+```
+
+Run the bounded multi-output soundness check:
+
+```bash
+venv/bin/python test_partitioned_miter_soundness.py --max-inputs 2 --max-gates 2 --output-count 2 --max-output-sets 24 --partition-sizes 1,2 --budget 0
+```
+
+Exercise the optional Algorithm 10 cone mode without changing the default:
+
+```bash
+ALG10_CONE_ENGINE=partitioned ALG10_CONE_PARTITION_SIZE=1 ALG10_CONE_PARTITION_MIN_ROOTS=2 venv/bin/python main.py
+```
+
+Use a separate checkpoint directory for partition experiments, and raise the
+partition-only cone cap only when testing hard circuits:
+
+```bash
+ALG10_CHECKPOINT_DIR=results_optimized/alg10_checkpoints_partitioned_experiment \
+ALG10_CONE_ENGINE=partitioned \
+ALG10_CONE_PARTITION_SIZE=1 \
+ALG10_CONE_PARTITION_MIN_ROOTS=2 \
+ALG10_CONE_PARTITION_MAX_GATES=50000 \
+ALG10_AUDIT_ASSUMPTIONS=1 \
+venv/bin/python main.py
+```
+
+Use partitioned mode as an experiment first. It is exact only because every
+affected observable root is audited into exactly one partition; any SAT rejects,
+all-UNSAT accepts, and timeout remains unresolved.
+
+## Pair Stuck-At Experiment
+
+Run the bounded pair-miter soundness check before any benchmark experiment:
+
+```bash
+venv/bin/python test_pair_stuckat_soundness.py --max-inputs 2 --max-gates 2 --output-count 2 --max-output-sets 24 --budget 0
+```
+
+Run a small real-circuit pair search:
+
+```bash
+venv/bin/python pair_stuckat_experiment.py --circuits benchmarks/c17.aag benchmarks/c432.aag --budget 5000 --max-candidates 60 --max-pairs 500 --seconds 30 --min-affected-roots 1 --sim-patterns 32
+```
+
+Compare against SAT-only pair checking by disabling the rejection-only
+simulation filter:
+
+```bash
+venv/bin/python pair_stuckat_experiment.py --circuits benchmarks/c880.aag --budget 5000 --max-candidates 120 --max-pairs 3000 --seconds 60 --min-affected-roots 1 --sim-patterns 0
+```
+
+Optional pair filters are `--pair-filter same_roots` and
+`--pair-filter overlap_roots`. These are search-space filters only; they do not
+change the proof obligation for any pair that reaches SAT.
+
+Use `--solve-singles` when pair classification matters. Without it, the runner
+solves singles only after a pair UNSAT so `Pair_Only_UNSAT` remains meaningful.
+
+Run a tiny frontier smoke from an Alg10 checkpoint. If `--circuits` is omitted,
+the script uses the checkpoint's matching `.work.aag`:
+
+```bash
+venv/bin/python pair_stuckat_experiment.py \
+  --checkpoint-json results_optimized/alg10_checkpoints_partitioned_experiment/custom_epfl_arithmetic_log2_8bfd84a960b5.json \
+  --checkpoint-frontier pending \
+  --budget 100 \
+  --max-candidates 20 \
+  --max-pairs 30 \
+  --seconds 30 \
+  --sim-patterns 32
+```
+
+Pair checks are experiment-only. A pair UNSAT is sound only for atomic commit of
+both replacements in the same accepted context; do not promote into `main.py`
+unless pair-only UNSATs appear and bounded tests remain clean.
+
+## Packed Pre-SAT Simulation Experiment
+
+Run the bounded soundness check for packed rejection-only simulation:
+
+```bash
+venv/bin/python test_alg10_presim_packing.py --max-inputs 2 --max-gates 2 --output-count 2 --max-output-sets 24 --max-pack-bits 128
+```
+
+Compare packed pre-sim against the current scalar-pattern pre-sim:
+
+```bash
+venv/bin/python alg10_presim_packing_experiment.py \
+  --circuits benchmarks/c432.aag benchmarks/c880.aag benchmarks/c1355.aag benchmarks/c1908.aag \
+  --max-candidates 300 \
+  --walk-patterns 16 \
+  --random-patterns 64 \
+  --max-pack-bits 4096 \
+  --compare-scalar
+```
+
+Use the packed engine in Algorithm 10 only as an audited experiment:
+
+```bash
+ALG10_PRE_SIM_REJECTION=1 \
+ALG10_PRE_SIM_ENGINE=packed \
+ALG10_PRE_SIM_PACKED_MAX_BITS=4096 \
+ALG10_AUDIT_ASSUMPTIONS=1 \
+venv/bin/python main.py
+```
+
+Packed pre-sim is rejection-only. It can skip candidates that are visibly
+non-equivalent under concrete input patterns; it cannot accept a redundancy.
+
+## Global SAT Solver Experiment
+
+Compare PySAT backends on the same Algorithm 10 global frontier without
+rewriting or checkpoint changes:
+
+```bash
+venv/bin/python global_solver_experiment.py \
+  --checkpoint-json results_optimized/alg10_checkpoints_packed_from_strict/custom_epfl_arithmetic_log2_8bfd84a960b5.json \
+  --checkpoint-frontier candidates \
+  --solvers glucose4,cadical153,cadical195,maplecm,minisat22 \
+  --budgets 1000 \
+  --max-candidates 60 \
+  --seconds 60
+```
+
+Use a different global solver in Algorithm 10 only as an experiment:
+
+```bash
+ALG10_CHECKPOINT_DIR=results_optimized/alg10_checkpoints_packed_from_strict \
+ALG10_GLOBAL_SOLVER=cadical153 \
+ALG10_GLOBAL_MAX_CONSEC_TIMEOUTS=80 \
+ALG10_PRE_SIM_REJECTION=1 \
+ALG10_PRE_SIM_ENGINE=packed \
+ALG10_PRE_SIM_PACKED_MAX_BITS=4096 \
+ALG10_AUDIT_ASSUMPTIONS=1 \
+venv/bin/python main.py
+```
+
+`ALG10_GLOBAL_MAX_CONSEC_TIMEOUTS` is a checkpointing safety valve. It does not
+accept or reject candidates; it stops a global frontier run after repeated
+timeouts so later work can change strategy instead of spending the whole budget
+on one hard streak.
+
+SAT-only global frontier strategy experiment:
+
+```bash
+venv/bin/python global_sat_strategy_experiment.py \
+  --checkpoint-json results_optimized/alg10_checkpoints_global_strategy_div/custom_epfl_arithmetic_div_242292af29fd.json \
+  --checkpoint-frontier candidates \
+  --solver cadical153 \
+  --orders current,reverse,untried_first,tried_asc,depth_desc,fanout_desc \
+  --budget-kinds conf \
+  --budget 1000 \
+  --reuse-modes incremental,rebuild:20 \
+  --phase-modes none,model \
+  --max-candidates 80 \
+  --output-dir results_optimized/global_sat_strategy_div
+```
+
+Run Alg10 with the best current SAT-side strategy observed on hard frontiers:
+
+```bash
+ALG10_GLOBAL_SOLVER=cadical153 \
+ALG10_GLOBAL_FRONTIER_ORDER=untried_first \
+ALG10_GLOBAL_PHASE_MODE=model \
+ALG10_GLOBAL_MAX_CONSEC_TIMEOUTS=80 \
+ALG10_AUDIT_ASSUMPTIONS=1 \
+venv/bin/python main.py
+```
+
+These knobs do not change the proof obligation. They only reorder the global
+frontier and set SAT polarity hints; every UNSAT acceptance still uses the same
+global assumptions, assumption audit, and final ABC CEC.
+
+Run the transactional parallel Algorithm 10 coordinator on one circuit:
+
+```bash
+venv/bin/python alg10_parallel_commit_coordinator.py \
+  path/to/source.aag \
+  results_optimized/parallel_commit/source.aag \
+  --checkpoint-dir results_optimized/alg10_checkpoints_parallel_commit \
+  --checkpoint-json path/to/source_checkpoint.json \
+  --jobs 3 \
+  --budgets 1000000,2000000,5000000 \
+  --batch-size 16 \
+  --seconds 3600 \
+  --solver cadical153 \
+  --order untried_first
+```
+
+Use the checkpoint's exact `source_path` as the first argument; source hashes
+must match. Worker processes classify a frozen frontier and never edit the
+AAG. The coordinator serially rechecks queued UNSAT proposals in one cumulative
+solver, performs the rewrite, requires direct ABC CEC `PASS`, saves the
+checkpoint, and only then starts a new generation. With a four-core machine,
+`--jobs 3` reserves one core for the coordinator and system work.
+
+The `--seconds` limit is checked between generations. A SAT wave already in
+progress may finish after the nominal deadline.
+
 ## Focused Checks
 
 Run individual validation scripts:
@@ -144,6 +386,7 @@ python3 test_alg3_sandbox.py
 python3 test_encoding_surgery.py
 python3 test_alg9_random_observability.py
 python3 test_alg10_checkpoint.py
+python3 test_alg10_parallel_commit_coordinator.py
 python3 test_algorithms_1_to_10.py
 ```
 

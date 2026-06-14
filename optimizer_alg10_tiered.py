@@ -68,6 +68,11 @@ PRE_STRASH_MAX_GATES = int(os.environ.get("ALG10_PRE_STRASH_MAX_GATES", "100000"
 COMMIT_UNIT_CLAUSES = os.environ.get("ALG10_COMMIT_UNITS", "1") != "0"
 CHECKPOINT_DIR = os.environ.get("ALG10_CHECKPOINT_DIR", "results_optimized/alg10_checkpoints")
 RESET_CHECKPOINT = os.environ.get("ALG10_RESET_CHECKPOINT", "0") != "0"
+CHECKPOINT_SELECT_POLICY = os.environ.get("ALG10_CHECKPOINT_SELECT", "gates").strip().lower()
+if CHECKPOINT_SELECT_POLICY not in {"gates", "unresolved", "recent"}:
+    CHECKPOINT_SELECT_POLICY = "gates"
+EXTRA_CHECKPOINT_DIRS_RAW = os.environ.get("ALG10_EXTRA_CHECKPOINT_DIRS", "")
+PROTECT_BEST_CHECKPOINT = os.environ.get("ALG10_PROTECT_BEST_CHECKPOINT", "1") != "0"
 TFI_CONSTANCY = os.environ.get("ALG10_TFI_CONSTANCY", "1") != "0"
 TFI_BUDGET = int(os.environ.get("ALG10_TFI_BUDGET", "500" if MODE == "fast_save" else "2000"))
 TFI_MAX_CONE_GATES = int(
@@ -94,21 +99,63 @@ WINDOW_MAX_CONE_GATES = int(
 )
 CONE_MITER = os.environ.get("ALG10_CONE_MITER", "1") != "0"
 CONE_ENGINE = os.environ.get("ALG10_CONE_ENGINE", "single").strip().lower()
-if CONE_ENGINE not in {"single", "grouped", "hybrid"}:
+if CONE_ENGINE not in {"single", "grouped", "hybrid", "partitioned", "hybrid_partitioned"}:
     CONE_ENGINE = "single"
 CONE_SOLVER = os.environ.get("ALG10_CONE_SOLVER", "cadical153").strip() or "cadical153"
 CONE_GROUP_MIN_SIZE = max(1, int(os.environ.get("ALG10_CONE_GROUP_MIN_SIZE", "8")))
+CONE_PARTITION_SIZE = max(1, int(os.environ.get("ALG10_CONE_PARTITION_SIZE", "1")))
+CONE_PARTITION_MIN_ROOTS = max(1, int(os.environ.get("ALG10_CONE_PARTITION_MIN_ROOTS", "2")))
+CONE_PARTITION_CONTINUE_AFTER_TIMEOUT = (
+    os.environ.get("ALG10_CONE_PARTITION_CONTINUE_AFTER_TIMEOUT", "1") != "0"
+)
 CONE_BUDGET = int(os.environ.get("ALG10_CONE_BUDGET", "1000" if MODE == "fast_save" else "5000"))
 CONE_MAX_GATES = int(
     os.environ.get("ALG10_CONE_MAX_GATES", "5000" if MODE == "fast_save" else "20000")
 )
+CONE_PARTITION_MAX_GATES = max(
+    0,
+    int(os.environ.get("ALG10_CONE_PARTITION_MAX_GATES", str(CONE_MAX_GATES))),
+)
 GLOBAL_MITER = os.environ.get("ALG10_GLOBAL_MITER", "1") != "0"
+GLOBAL_SOLVER = os.environ.get("ALG10_GLOBAL_SOLVER", "glucose4").strip() or "glucose4"
+GLOBAL_MAX_CONSEC_TIMEOUTS = max(
+    0, int(os.environ.get("ALG10_GLOBAL_MAX_CONSEC_TIMEOUTS", "0"))
+)
+GLOBAL_FRONTIER_ORDER = os.environ.get("ALG10_GLOBAL_FRONTIER_ORDER", "current").strip().lower()
+if GLOBAL_FRONTIER_ORDER not in {
+    "current",
+    "untried_first",
+    "tried_asc",
+    "tried_desc",
+    "topo",
+    "forward",
+    "reverse",
+    "reverse_topo",
+    "depth_desc",
+    "depth_asc",
+    "fanout_desc",
+    "fanout_asc",
+    "stuck0_first",
+    "stuck1_first",
+    "random",
+}:
+    GLOBAL_FRONTIER_ORDER = "current"
+GLOBAL_PHASE_MODE = os.environ.get("ALG10_GLOBAL_PHASE_MODE", "none").strip().lower()
+if GLOBAL_PHASE_MODE not in {"none", "controls_false", "model", "controls_false_model"}:
+    GLOBAL_PHASE_MODE = "none"
+GLOBAL_PHASE_MODEL_LIMIT = max(
+    0, int(os.environ.get("ALG10_GLOBAL_PHASE_MODEL_LIMIT", "20000"))
+)
 PHASE_LOCAL_RESUME = os.environ.get("ALG10_PHASE_LOCAL_RESUME", "0") != "0"
 EXACT_FRONTIER_RESUME = os.environ.get("ALG10_EXACT_FRONTIER_RESUME", "0") != "0"
 CEX_POOL = os.environ.get("ALG10_CEX_POOL", "0") != "0"
 CEX_POOL_MAX_VECTORS = int(os.environ.get("ALG10_CEX_POOL_MAX_VECTORS", "10000"))
 CEX_POOL_REPLAY_MAX_VECTORS = int(os.environ.get("ALG10_CEX_POOL_REPLAY_MAX_VECTORS", "0"))
 PRE_SIM_REJECTION = os.environ.get("ALG10_PRE_SIM_REJECTION", "0") != "0"
+PRE_SIM_ENGINE = os.environ.get("ALG10_PRE_SIM_ENGINE", "scalar").strip().lower()
+if PRE_SIM_ENGINE not in {"scalar", "packed"}:
+    PRE_SIM_ENGINE = "scalar"
+PRE_SIM_PACKED_MAX_BITS = max(1, int(os.environ.get("ALG10_PRE_SIM_PACKED_MAX_BITS", "4096")))
 PRE_SIM_RANDOM_PATTERNS = int(
     os.environ.get("ALG10_PRE_SIM_RANDOM_PATTERNS", "64" if MODE == "fast_save" else "128")
 )
@@ -212,6 +259,16 @@ def _checkpoint_path_pair(stem):
     )
 
 
+def _checkpoint_dirs_to_search():
+    dirs = [CHECKPOINT_DIR]
+    raw = EXTRA_CHECKPOINT_DIRS_RAW.replace(os.pathsep, ",")
+    for part in raw.split(","):
+        directory = part.strip()
+        if directory and directory not in dirs:
+            dirs.append(directory)
+    return dirs
+
+
 def _checkpoint_path_candidates(circuit_path):
     content_stem = _checkpoint_content_stem(circuit_path)
     legacy_stem = _checkpoint_path_stem(circuit_path)
@@ -221,10 +278,11 @@ def _checkpoint_path_candidates(circuit_path):
     return [_checkpoint_path_pair(stem) for stem in stems]
 
 
-def _same_source_checkpoint_candidates(circuit_path, source_sha):
+def _same_source_checkpoint_candidates(circuit_path, source_sha, checkpoint_dir=None):
+    checkpoint_dir = checkpoint_dir or CHECKPOINT_DIR
     safe = _safe_checkpoint_base(circuit_path)
-    preferred_pattern = os.path.join(CHECKPOINT_DIR, f"{safe}_*.json")
-    fallback_pattern = os.path.join(CHECKPOINT_DIR, "*.json")
+    preferred_pattern = os.path.join(checkpoint_dir, f"{safe}_*.json")
+    fallback_pattern = os.path.join(checkpoint_dir, "*.json")
     pairs = []
     seen = set()
     for json_path in sorted(glob.glob(preferred_pattern)) + sorted(glob.glob(fallback_pattern)):
@@ -239,10 +297,57 @@ def _same_source_checkpoint_candidates(circuit_path, source_sha):
             work_path = data.get("work_aag") or os.path.splitext(json_path)[0] + ".work.aag"
             if not os.path.isabs(work_path):
                 work_path = os.path.join(os.getcwd(), work_path)
-            pairs.append((json_path, work_path))
+            pairs.append((json_path, work_path, checkpoint_dir))
         except Exception:
             continue
     return pairs
+
+
+def _checkpoint_rank(gates, unresolved, timestamp):
+    if CHECKPOINT_SELECT_POLICY == "unresolved":
+        return (unresolved, gates, -timestamp)
+    if CHECKPOINT_SELECT_POLICY == "recent":
+        return (-timestamp, gates, unresolved)
+    return (gates, unresolved, -timestamp)
+
+
+def _phase_resume_unresolved_count(state):
+    if not isinstance(state, dict):
+        return None
+    if state.get("schema") == "alg10_global_frontier_v1" or "candidates" in state:
+        candidates = state.get("candidates")
+        return len(candidates) if isinstance(candidates, list) else None
+    if state.get("schema") == "alg10_tier_frontier_v1":
+        pending = state.get("pending")
+        escalated = state.get("escalated")
+        if isinstance(pending, list) and isinstance(escalated, list):
+            return len(pending) + len(escalated)
+    return None
+
+
+def _checkpoint_unresolved_from_data(data):
+    try:
+        unresolved = int(data.get("telemetry", {}).get("unresolved", 10**18))
+    except Exception:
+        unresolved = 10**18
+    frontier_unresolved = _phase_resume_unresolved_count(data.get("phase_resume"))
+    if frontier_unresolved is not None:
+        unresolved = max(unresolved, int(frontier_unresolved))
+    return unresolved
+
+
+def _checkpoint_rank_from_data(data, work_path):
+    _, _, _, _, current_gates, _, _, _, _, _ = parse_aag(work_path)
+    try:
+        stored_gates = int(data.get("current_gates", current_gates))
+    except Exception:
+        stored_gates = current_gates
+    unresolved = _checkpoint_unresolved_from_data(data)
+    try:
+        timestamp = float(data.get("timestamp", 0) or 0)
+    except Exception:
+        timestamp = 0.0
+    return _checkpoint_rank(min(stored_gates, current_gates), unresolved, timestamp)
 
 
 def _checkpoint_paths(circuit_path):
@@ -389,7 +494,7 @@ def _candidate_set_from_resume_items(items, gate_count):
             return None
         cand = (idx, stuck_value)
         if cand in seen:
-            continue
+            return None
         seen.add(cand)
         result.append(cand)
     return result
@@ -435,10 +540,11 @@ def _candidate_info_from_resume(state, gate_count):
         if idx < 0 or idx >= gate_count or stuck_value not in (0, 1):
             return None
         cand = (idx, stuck_value)
-        if cand not in seen:
-            seen.add(cand)
-            result.append(cand)
-            max_budget_tried[cand] = max(0, tried)
+        if cand in seen:
+            return None
+        seen.add(cand)
+        result.append(cand)
+        max_budget_tried[cand] = max(0, tried)
     return result, max_budget_tried
 
 
@@ -453,6 +559,8 @@ def _tier_frontier_info_from_resume(state, gate_count):
     pending = _candidate_set_from_resume_items(state.get("pending", []), gate_count)
     escalated = _candidate_set_from_resume_items(state.get("escalated", []), gate_count)
     if pending is None or escalated is None:
+        return None
+    if set(pending).intersection(escalated):
         return None
     return {
         "tier": state.get("tier"),
@@ -501,13 +609,18 @@ def _load_checkpoint(circuit_path):
     except Exception:
         return None
 
-    candidates = list(_checkpoint_path_candidates(circuit_path))
-    for pair in _same_source_checkpoint_candidates(circuit_path, source_sha):
-        if pair not in candidates:
-            candidates.append(pair)
+    active_dir_abs = os.path.abspath(CHECKPOINT_DIR)
+    candidates = [
+        (json_path, work_path, CHECKPOINT_DIR)
+        for json_path, work_path in _checkpoint_path_candidates(circuit_path)
+    ]
+    for checkpoint_dir in _checkpoint_dirs_to_search():
+        for pair in _same_source_checkpoint_candidates(circuit_path, source_sha, checkpoint_dir):
+            if pair not in candidates:
+                candidates.append(pair)
 
     valid = []
-    for json_path, work_path in candidates:
+    for json_path, work_path, checkpoint_dir in candidates:
         if not os.path.exists(json_path) or not os.path.exists(work_path):
             continue
 
@@ -519,53 +632,84 @@ def _load_checkpoint(circuit_path):
             _, _, _, _, current_gates, _, _, _, _, _ = parse_aag(work_path)
             data["_checkpoint_json_path"] = json_path
             data["_checkpoint_work_path"] = work_path
-            try:
-                stored_gates = int(data.get("current_gates", current_gates))
-            except Exception:
-                stored_gates = current_gates
-            try:
-                unresolved = int(data.get("telemetry", {}).get("unresolved", 10**18))
-            except Exception:
-                unresolved = 10**18
-            valid.append((min(stored_gates, current_gates), unresolved, -float(data.get("timestamp", 0) or 0), data))
+            data["_checkpoint_source_dir"] = checkpoint_dir
+            imported = os.path.abspath(checkpoint_dir) != active_dir_abs
+            data["_checkpoint_imported_external"] = int(imported)
+            rank = _checkpoint_rank_from_data(data, work_path)
+            valid.append((*rank, data))
         except Exception:
             continue
     if valid:
-        valid.sort(key=lambda item: item[:3])
-        return valid[0][3]
+        valid.sort(key=lambda item: item[:-1])
+        return valid[0][-1]
     return None
 
 
 def _save_checkpoint(circuit_path, work_path, telemetry, status, phase_resume_state=None):
     json_path, checkpoint_work = _checkpoint_paths(circuit_path)
-    shutil.copy(work_path, checkpoint_work)
 
     try:
-        _, _, _, _, current_gates, _, _, _, _, _ = parse_aag(checkpoint_work)
+        _, _, _, _, current_gates, _, _, _, _, _ = parse_aag(work_path)
     except Exception:
         current_gates = 0
 
+    source_sha = _sha256_file(circuit_path)
+    timestamp = time.time()
+
     if phase_resume_state and PHASE_LOCAL_RESUME:
         phase_resume_state = dict(phase_resume_state)
-        phase_resume_state["work_sha256"] = _sha256_file(checkpoint_work)
+        phase_resume_state["work_sha256"] = _sha256_file(work_path)
         phase_resume_state["gate_count"] = current_gates
     else:
         phase_resume_state = None
+
+    stored_telemetry = dict(telemetry)
+    frontier_unresolved = _phase_resume_unresolved_count(phase_resume_state)
+    if frontier_unresolved is not None:
+        try:
+            telemetry_unresolved = int(stored_telemetry.get("unresolved", 0))
+        except Exception:
+            telemetry_unresolved = 0
+        stored_telemetry["unresolved"] = max(telemetry_unresolved, frontier_unresolved)
 
     data = {
         "algorithm": "ALG10",
         "mode": MODE,
         "status": status,
-        "timestamp": time.time(),
+        "timestamp": timestamp,
         "source_path": os.path.abspath(circuit_path),
-        "source_sha256": _sha256_file(circuit_path),
+        "source_sha256": source_sha,
         "work_aag": checkpoint_work,
         "current_gates": current_gates,
         "budgets": SAT_BUDGETS,
         "phase_resume": phase_resume_state,
-        "telemetry": telemetry,
+        "telemetry": stored_telemetry,
     }
 
+    if PROTECT_BEST_CHECKPOINT:
+        try:
+            unresolved = _checkpoint_unresolved_from_data(data)
+            candidate_rank = _checkpoint_rank(current_gates, unresolved, timestamp)
+            best_existing = None
+            for checkpoint_dir in _checkpoint_dirs_to_search():
+                for existing_json, existing_work, _dir in _same_source_checkpoint_candidates(
+                    circuit_path, source_sha, checkpoint_dir
+                ):
+                    if not os.path.exists(existing_json) or not os.path.exists(existing_work):
+                        continue
+                    with open(existing_json, "r", encoding="utf-8") as f:
+                        existing_data = json.load(f)
+                    if existing_data.get("source_sha256") != source_sha:
+                        continue
+                    existing_rank = _checkpoint_rank_from_data(existing_data, existing_work)
+                    if best_existing is None or existing_rank < best_existing[0]:
+                        best_existing = (existing_rank, existing_json)
+            if best_existing is not None and best_existing[0] < candidate_rank:
+                return best_existing[1]
+        except Exception:
+            pass
+
+    shutil.copy(work_path, checkpoint_work)
     tmp_path = json_path + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, sort_keys=True)
@@ -573,8 +717,7 @@ def _save_checkpoint(circuit_path, work_path, telemetry, status, phase_resume_st
     return json_path
 
 
-def _candidate_order(gates_raw, roots=None):
-    """Return all SA0/SA1 candidates, ranked but never filtered away."""
+def _gate_depth_fanout(gates_raw):
     defined_by_var = {lhs >> 1: idx for idx, (lhs, _, _) in enumerate(gates_raw)}
     fanout = [0 for _ in gates_raw]
     depth = [0 for _ in gates_raw]
@@ -590,6 +733,12 @@ def _candidate_order(gates_raw, roots=None):
                 else:
                     d1 = depth[parent] + 1
         depth[idx] = max(d0, d1)
+    return depth, fanout
+
+
+def _candidate_order(gates_raw, roots=None):
+    """Return all SA0/SA1 candidates, ranked but never filtered away."""
+    depth, fanout = _gate_depth_fanout(gates_raw)
 
     order = CANDIDATE_ORDER
     candidates = [(idx, value) for idx in range(len(gates_raw)) for value in (0, 1)]
@@ -631,6 +780,48 @@ def _candidate_order(gates_raw, roots=None):
     return sorted(candidates, key=key)
 
 
+def _order_global_frontier(candidates, gates_raw, max_budget_tried):
+    order = GLOBAL_FRONTIER_ORDER
+    items = list(candidates)
+    if order == "current":
+        return items
+    if order == "random":
+        rng = random.Random(CANDIDATE_RANDOM_SEED + len(gates_raw) + len(items))
+        rng.shuffle(items)
+        return items
+
+    depth, fanout = _gate_depth_fanout(gates_raw)
+
+    def key(item):
+        idx, value = item
+        tried = max_budget_tried.get((idx, value), 0)
+        if order == "untried_first":
+            return (1 if tried > 0 else 0, tried, idx, value)
+        if order == "tried_asc":
+            return (tried, idx, value)
+        if order == "tried_desc":
+            return (-tried, idx, value)
+        if order in {"topo", "forward"}:
+            return (idx, value)
+        if order in {"reverse", "reverse_topo"}:
+            return (-idx, value)
+        if order == "depth_desc":
+            return (-depth[idx], idx, value)
+        if order == "depth_asc":
+            return (depth[idx], idx, value)
+        if order == "fanout_desc":
+            return (-fanout[idx], -depth[idx], idx, value)
+        if order == "fanout_asc":
+            return (fanout[idx], depth[idx], idx, value)
+        if order == "stuck0_first":
+            return (value, idx)
+        if order == "stuck1_first":
+            return (-value, idx)
+        return (idx, value)
+
+    return sorted(items, key=key)
+
+
 def _empty_phase_telemetry():
     return {
         "checks": 0,
@@ -662,6 +853,21 @@ def _empty_phase_telemetry():
         "cone_unsat": 0,
         "cone_timeouts": 0,
         "cone_skipped": 0,
+        "cone_partition_checks": 0,
+        "cone_partition_sat": 0,
+        "cone_partition_unsat": 0,
+        "cone_partition_timeouts": 0,
+        "cone_partition_groups": 0,
+        "cone_partition_audit_fail": 0,
+        "cone_partition_skipped": 0,
+        "cone_partition_no_affected": 0,
+        "cone_partition_below_min_roots": 0,
+        "cone_partition_target_outside_cone": 0,
+        "cone_partition_cone_too_large": 0,
+        "cone_partition_fallbacks": 0,
+        "cone_partition_max_cone_gates": 0,
+        "cone_partition_max_seen_cone_gates": 0,
+        "cone_partition_max_skipped_cone_gates": 0,
         "global_checks": 0,
         "global_sat": 0,
         "global_unsat": 0,
@@ -878,6 +1084,21 @@ def _solve_limited_with_budget(solver, assumptions, budget):
         solver.conf_budget(budget)
         return solver.solve_limited(assumptions=assumptions)
     return solver.solve(assumptions=assumptions)
+
+
+def _apply_global_initial_phases(solver, f0_lits, f1_lits):
+    if GLOBAL_PHASE_MODE in {"controls_false", "controls_false_model"}:
+        solver.set_phases([-lit for lit in f0_lits])
+        solver.set_phases([-lit for lit in f1_lits])
+
+
+def _apply_global_model_phases(solver, model):
+    if GLOBAL_PHASE_MODE not in {"model", "controls_false_model"} or not model:
+        return
+    if GLOBAL_PHASE_MODEL_LIMIT > 0:
+        solver.set_phases(model[:GLOBAL_PHASE_MODEL_LIMIT])
+    else:
+        solver.set_phases(model)
 
 
 def _cex_prune_tfi_candidates(
@@ -1519,6 +1740,169 @@ def _cone_miter_check(
     return "SAT", primary_values
 
 
+def _partition_roots(roots, partition_size):
+    return [list(roots[pos : pos + partition_size]) for pos in range(0, len(roots), partition_size)]
+
+
+def _root_counts(roots):
+    counts = {}
+    for root in roots:
+        counts[root] = counts.get(root, 0) + 1
+    return counts
+
+
+def _audit_cone_root_partitions(affected, partitions):
+    if affected and not partitions:
+        raise AssertionError("non-empty affected roots produced no cone partitions")
+    if any(not group for group in partitions):
+        raise AssertionError("empty cone partition")
+    flattened = []
+    for group in partitions:
+        flattened.extend(group)
+    if _root_counts(flattened) != _root_counts(affected):
+        raise AssertionError("cone partition roots do not exactly cover affected roots")
+
+
+def _solve_single_fault_roots(
+    inputs,
+    latches,
+    roots,
+    gates_raw,
+    target_idx,
+    stuck_value,
+    timings,
+    by_lhs,
+    telemetry=None,
+):
+    cone = _fanin_indices_for_roots(gates_raw, roots, by_lhs=by_lhs)
+    if telemetry is not None:
+        telemetry["cone_partition_max_seen_cone_gates"] = max(
+            telemetry["cone_partition_max_seen_cone_gates"], len(cone)
+        )
+    if target_idx not in cone:
+        return "SKIP_TARGET_OUTSIDE_CONE", None
+    if CONE_PARTITION_MAX_GATES > 0 and len(cone) > CONE_PARTITION_MAX_GATES:
+        return f"SKIP_CONE_TOO_LARGE:{len(cone)}", None
+
+    t_encode = time.time()
+    clauses, miter_lit, shared = _build_single_fault_cone_miter(
+        inputs, latches, roots, gates_raw, target_idx, stuck_value, cone
+    )
+    timings["Encode"] += time.time() - t_encode
+
+    t_sat = time.time()
+    with Glucose4(bootstrap_with=clauses) as solver:
+        solver.conf_budget(CONE_BUDGET)
+        result = solver.solve_limited(assumptions=[miter_lit])
+        model = solver.get_model() if result is True and (CEX_PRUNING or CEX_POOL) else None
+    timings["SAT"] += time.time() - t_sat
+
+    if result is None:
+        return "TIMEOUT", None
+    if result is False:
+        return "UNSAT", None
+    primary_values = _model_primary_values_from_shared(inputs, latches, model, shared) if model else None
+    return "SAT", primary_values
+
+
+def _partitioned_cone_miter_check(
+    inputs,
+    latches,
+    outputs,
+    gates_raw,
+    target_idx,
+    stuck_value,
+    timings,
+    by_lhs,
+    fanout,
+    telemetry=None,
+):
+    affected = _affected_roots_from_graph(by_lhs, fanout, outputs, target_idx)
+    if not affected:
+        if telemetry is not None:
+            telemetry["cone_partition_skipped"] += 1
+            telemetry["cone_partition_no_affected"] += 1
+        return "SKIP", None
+    if len(affected) < CONE_PARTITION_MIN_ROOTS:
+        if telemetry is not None:
+            telemetry["cone_partition_skipped"] += 1
+            telemetry["cone_partition_below_min_roots"] += 1
+        return "SKIP", None
+
+    partitions = _partition_roots(affected, CONE_PARTITION_SIZE)
+    try:
+        _audit_cone_root_partitions(affected, partitions)
+    except AssertionError:
+        if telemetry is not None:
+            telemetry["cone_partition_audit_fail"] += 1
+        return "SKIP", None
+
+    if telemetry is not None:
+        telemetry["cone_partition_checks"] += 1
+
+    saw_timeout = False
+    for roots in partitions:
+        if telemetry is not None:
+            telemetry["cone_partition_groups"] += 1
+        result, primary_values = _solve_single_fault_roots(
+            inputs,
+            latches,
+            roots,
+            gates_raw,
+            target_idx,
+            stuck_value,
+            timings,
+            by_lhs,
+            telemetry=telemetry,
+        )
+        if result == "SAT":
+            if telemetry is not None:
+                telemetry["cone_partition_sat"] += 1
+            return "SAT", primary_values
+        if result == "UNSAT":
+            continue
+        if result == "TIMEOUT":
+            saw_timeout = True
+            if not CONE_PARTITION_CONTINUE_AFTER_TIMEOUT:
+                if telemetry is not None:
+                    telemetry["cone_partition_timeouts"] += 1
+                return "TIMEOUT", None
+            continue
+        if result == "SKIP_TARGET_OUTSIDE_CONE":
+            if telemetry is not None:
+                telemetry["cone_partition_audit_fail"] += 1
+                telemetry["cone_partition_target_outside_cone"] += 1
+                telemetry["cone_partition_skipped"] += 1
+            return "SKIP", None
+        if result.startswith("SKIP_CONE_TOO_LARGE:"):
+            if telemetry is not None:
+                telemetry["cone_partition_cone_too_large"] += 1
+                telemetry["cone_partition_skipped"] += 1
+                try:
+                    cone_gates = int(result.split(":", 1)[1])
+                    telemetry["cone_partition_max_seen_cone_gates"] = max(
+                        telemetry["cone_partition_max_seen_cone_gates"], cone_gates
+                    )
+                    telemetry["cone_partition_max_skipped_cone_gates"] = max(
+                        telemetry["cone_partition_max_skipped_cone_gates"], cone_gates
+                    )
+                except Exception:
+                    pass
+            return "SKIP", None
+        if telemetry is not None:
+            telemetry["cone_partition_skipped"] += 1
+        return "SKIP", None
+
+    if saw_timeout:
+        if telemetry is not None:
+            telemetry["cone_partition_timeouts"] += 1
+        return "TIMEOUT", None
+
+    if telemetry is not None:
+        telemetry["cone_partition_unsat"] += 1
+    return "UNSAT", None
+
+
 def _bounded_tfo_window_roots(by_lhs, fanout, observable_roots, gates_raw, target_idx, levels):
     if levels < 0:
         return []
@@ -1905,6 +2289,7 @@ def _run_cone_miter_tier(
         escalated_candidates.append(cand)
 
     grouped_enabled = CONE_ENGINE in {"grouped", "hybrid"}
+    partitioned_enabled = CONE_ENGINE in {"partitioned", "hybrid_partitioned"}
     group_keys = {}
     group_cones = {}
     group_sizes = {}
@@ -1996,7 +2381,25 @@ def _run_cone_miter_tier(
             if idx in accepted or cand in pruned:
                 continue
 
-            if should_use_grouped((idx, stuck_value)):
+            if partitioned_enabled:
+                result, primary_values = _partitioned_cone_miter_check(
+                    inputs,
+                    latches,
+                    outputs,
+                    working_gates,
+                    idx,
+                    stuck_value,
+                    timings,
+                    by_lhs,
+                    fanout,
+                    telemetry=telemetry,
+                )
+                if result == "SKIP":
+                    telemetry["cone_partition_fallbacks"] += 1
+                    result, primary_values = _cone_miter_check(
+                        inputs, latches, outputs, working_gates, idx, stuck_value, timings, by_lhs, fanout
+                    )
+            elif should_use_grouped((idx, stuck_value)):
                 result, primary_values = grouped_check((idx, stuck_value))
                 if result == "SKIP" and CONE_ENGINE == "hybrid":
                     result, primary_values = _cone_miter_check(
@@ -2435,6 +2838,183 @@ def _cex_prune_candidates(
     )
 
 
+def _packed_pre_sim_lit_mask(aig_lit, primary_masks, gate_masks, by_lhs, full_mask):
+    if aig_lit == 0:
+        return 0
+    if aig_lit == 1:
+        return full_mask
+
+    base = aig_lit & ~1
+    idx = by_lhs.get(base)
+    if idx is not None:
+        mask = gate_masks[idx]
+    else:
+        mask = primary_masks.get(base, 0)
+    return mask ^ full_mask if (aig_lit & 1) else mask
+
+
+def _repeat_pre_sim_pattern_mask(mask, pattern_count, repeat_count):
+    result = 0
+    shift = 0
+    for _ in range(repeat_count):
+        result |= mask << shift
+        shift += pattern_count
+    return result
+
+
+def _primary_pre_sim_pattern_masks(inputs, latches, patterns):
+    bases = _primary_bases(inputs, latches)
+    masks = {base: 0 for base in bases}
+    for bit, (_kind, primary_values) in enumerate(patterns):
+        for base in bases:
+            if primary_values.get(base, False):
+                masks[base] |= 1 << bit
+    return masks
+
+
+def _good_root_pre_sim_pattern_masks(gates_raw, roots, primary_masks, by_lhs, pattern_mask):
+    gate_masks = [0 for _ in gates_raw]
+    for idx, (_lhs, r0, r1) in enumerate(gates_raw):
+        mask = _packed_pre_sim_lit_mask(r0, primary_masks, gate_masks, by_lhs, pattern_mask)
+        mask &= _packed_pre_sim_lit_mask(r1, primary_masks, gate_masks, by_lhs, pattern_mask)
+        gate_masks[idx] = mask
+    return [
+        _packed_pre_sim_lit_mask(root, primary_masks, gate_masks, by_lhs, pattern_mask)
+        for root in roots
+    ]
+
+
+def _cex_prune_from_primary_patterns_packed(
+    inputs,
+    latches,
+    roots,
+    gates_raw,
+    patterns,
+    accepted,
+    pending,
+    already_pruned,
+    telemetry=None,
+    timings=None,
+    deadline=None,
+):
+    """
+    Reject candidates using many concrete PI assignments packed into one pass.
+
+    This is equivalent in acceptance policy to repeated calls to
+    _cex_prune_from_primary_values: it only rejects candidates that produce an
+    observable root difference under at least one concrete assignment.
+    """
+    if not (CEX_PRUNING or PRE_SIM_REJECTION or CEX_POOL) or not pending or not patterns:
+        return 0, 0, 0, 0
+
+    candidates = [
+        cand
+        for cand in pending
+        if cand not in already_pruned and cand[0] not in accepted
+    ]
+    if CEX_PRUNING_MAX_CANDIDATES > 0:
+        candidates = candidates[:CEX_PRUNING_MAX_CANDIDATES]
+    if not candidates:
+        return 0, 0, 0, 0
+
+    pattern_count = len(patterns)
+    by_lhs = {lhs & ~1: idx for idx, (lhs, _, _) in enumerate(gates_raw)}
+    pattern_mask = (1 << pattern_count) - 1
+    primary_patterns = _primary_pre_sim_pattern_masks(inputs, latches, patterns)
+    good_roots = _good_root_pre_sim_pattern_masks(
+        gates_raw, roots, primary_patterns, by_lhs, pattern_mask
+    )
+
+    structured_mask = 0
+    for bit, (kind, _primary_values) in enumerate(patterns):
+        if kind == "structured":
+            structured_mask |= 1 << bit
+    random_mask = pattern_mask ^ structured_mask
+
+    batch_candidates = max(1, PRE_SIM_PACKED_MAX_BITS // pattern_count)
+    checked = 0
+    newly_pruned = 0
+    structured_pruned = 0
+    random_pruned = 0
+
+    for start in range(0, len(candidates), batch_candidates):
+        if _deadline_expired(deadline):
+            if telemetry is not None:
+                telemetry["abort_reason"] = "TIME_BUDGET_CHECKPOINT"
+                telemetry["unresolved"] = len(candidates) - start
+            break
+
+        batch = candidates[start : start + batch_candidates]
+        batch_len = len(batch)
+        full_mask = (1 << (batch_len * pattern_count)) - 1
+        primary_masks = {
+            base: _repeat_pre_sim_pattern_mask(mask, pattern_count, batch_len)
+            for base, mask in primary_patterns.items()
+        }
+        good_batch_roots = [
+            _repeat_pre_sim_pattern_mask(mask, pattern_count, batch_len)
+            for mask in good_roots
+        ]
+
+        force_zero = {}
+        force_one = {}
+        for slot, (idx, stuck_value) in enumerate(batch):
+            lane_mask = pattern_mask << (slot * pattern_count)
+            if stuck_value == 0:
+                force_zero[idx] = force_zero.get(idx, 0) | lane_mask
+            else:
+                force_one[idx] = force_one.get(idx, 0) | lane_mask
+
+        gate_masks = [0 for _ in gates_raw]
+        for idx, (_lhs, r0, r1) in enumerate(gates_raw):
+            if idx in accepted:
+                mask = full_mask if accepted[idx] else 0
+            else:
+                mask = _packed_pre_sim_lit_mask(r0, primary_masks, gate_masks, by_lhs, full_mask)
+                mask &= _packed_pre_sim_lit_mask(r1, primary_masks, gate_masks, by_lhs, full_mask)
+            if idx in force_zero:
+                mask &= full_mask ^ force_zero[idx]
+            if idx in force_one:
+                mask |= force_one[idx]
+            gate_masks[idx] = mask
+
+        diff_mask = 0
+        for root, good_mask in zip(roots, good_batch_roots):
+            root_mask = _packed_pre_sim_lit_mask(root, primary_masks, gate_masks, by_lhs, full_mask)
+            diff_mask |= root_mask ^ good_mask
+
+        checked += len(batch) * pattern_count
+        for slot, cand in enumerate(batch):
+            lane_diff = (diff_mask >> (slot * pattern_count)) & pattern_mask
+            if not lane_diff:
+                continue
+
+            audit_result = "NOT_AUDITED"
+            if telemetry is not None and timings is not None:
+                audit_result = _audit_cex_prune_if_enabled(
+                    inputs,
+                    latches,
+                    roots,
+                    gates_raw,
+                    accepted,
+                    cand,
+                    telemetry,
+                    timings,
+                    deadline=deadline,
+                )
+            if audit_result in {"UNSAT", "TIMEOUT", "SKIP"}:
+                continue
+
+            already_pruned.add(cand)
+            newly_pruned += 1
+            if lane_diff & structured_mask:
+                structured_pruned += 1
+            elif lane_diff & random_mask:
+                random_pruned += 1
+
+    return checked, newly_pruned, structured_pruned, random_pruned
+
+
 def _pre_sim_assignment(bases, bits):
     return {base: bool(bit) for base, bit in zip(bases, bits)}
 
@@ -2482,6 +3062,68 @@ def _run_pre_sim_rejection(inputs, latches, roots, gates_raw, candidates, teleme
     t_start = time.time()
     random_started = False
     low_gain_random_streak = 0
+
+    if PRE_SIM_ENGINE == "packed":
+        effective_deadline = local_deadline
+        if deadline is not None:
+            effective_deadline = min(deadline, local_deadline) if local_deadline is not None else deadline
+
+        patterns = []
+        for pattern in _iter_pre_sim_patterns(inputs, latches):
+            patterns.append(pattern)
+        structured_patterns = [pattern for pattern in patterns if pattern[0] != "random"]
+        random_patterns = [pattern for pattern in patterns if pattern[0] == "random"]
+
+        def run_packed(pattern_subset):
+            if not pattern_subset or _deadline_expired(deadline) or _deadline_expired(local_deadline):
+                return 0, 0, 0, 0
+            checked, newly_pruned, structured_pruned, random_pruned = (
+                _cex_prune_from_primary_patterns_packed(
+                    inputs,
+                    latches,
+                    roots,
+                    gates_raw,
+                    pattern_subset,
+                    {},
+                    candidates,
+                    pruned,
+                    telemetry if AUDIT_CEX_PRUNING else None,
+                    timings if AUDIT_CEX_PRUNING else None,
+                    deadline=effective_deadline,
+                )
+            )
+            telemetry["pre_sim_patterns"] += len(pattern_subset)
+            telemetry["pre_sim_checked"] += checked
+            telemetry["pre_sim_pruned"] += newly_pruned
+            telemetry["pre_sim_structured_pruned"] += structured_pruned
+            telemetry["pre_sim_random_pruned"] += random_pruned
+            if newly_pruned:
+                for _kind, primary_values in pattern_subset[:4]:
+                    _cex_pool_add(inputs, latches, primary_values, telemetry)
+            return checked, newly_pruned, structured_pruned, random_pruned
+
+        _checked, _newly_pruned, _structured_pruned, _random_pruned = run_packed(
+            structured_patterns
+        )
+        if PRE_SIM_ADAPTIVE:
+            min_pruned = max(
+                PRE_SIM_ADAPTIVE_MIN_RANDOM_PRUNED,
+                int(len(candidates) * PRE_SIM_ADAPTIVE_MIN_RANDOM_FRACTION),
+            )
+            if len(pruned) < min_pruned:
+                telemetry["pre_sim_adaptive_stop"] = "LOW_STRUCTURED_GAIN"
+                elapsed = time.time() - t_start
+                telemetry["pre_sim_time"] += elapsed
+                timings["PreSAT_Sim"] += elapsed
+                return pruned
+
+        if len(pruned) < len(candidates):
+            run_packed(random_patterns)
+
+        elapsed = time.time() - t_start
+        telemetry["pre_sim_time"] += elapsed
+        timings["PreSAT_Sim"] += elapsed
+        return pruned
 
     for kind, primary_values in _iter_pre_sim_patterns(inputs, latches):
         if _deadline_expired(deadline) or _deadline_expired(local_deadline):
@@ -2631,10 +3273,14 @@ def _run_budgeted_global_sat(
     if not unresolved:
         telemetry["unresolved"] = 0
         return accepted, telemetry
+    unresolved = _order_global_frontier(unresolved, gates_raw, max_budget_tried)
 
     t_sat = time.time()
     try:
-        with Glucose4(bootstrap_with=clauses) as solver:
+        with Solver(name=GLOBAL_SOLVER, bootstrap_with=clauses) as solver:
+            _apply_global_initial_phases(solver, f0_lits, f1_lits)
+            last_phase_model = None
+            consecutive_timeouts = 0
             for budget in SAT_BUDGETS:
                 telemetry["budget_rounds"] += 1
                 telemetry["max_budget"] = budget
@@ -2688,6 +3334,7 @@ def _run_budgeted_global_sat(
 
                     telemetry["checks"] += 1
                     telemetry["global_checks"] += 1
+                    _apply_global_model_phases(solver, last_phase_model)
                     solver.conf_budget(budget)
                     result = solver.solve_limited(assumptions=assumptions)
 
@@ -2698,12 +3345,44 @@ def _run_budgeted_global_sat(
                             max_budget_tried.get((idx, stuck_value), 0), budget
                         )
                         next_unresolved.append((idx, stuck_value))
+                        consecutive_timeouts += 1
+                        if (
+                            GLOBAL_MAX_CONSEC_TIMEOUTS > 0
+                            and consecutive_timeouts >= GLOBAL_MAX_CONSEC_TIMEOUTS
+                        ):
+                            telemetry["abort_reason"] = "GLOBAL_TIMEOUT_STREAK"
+                            remaining = [
+                                cand
+                                for cand in next_unresolved + unresolved[candidate_pos + 1 :]
+                                if cand not in pruned and cand[0] not in accepted
+                            ]
+                            telemetry["unresolved"] = len(remaining)
+                            telemetry["_phase_resume_state"] = {
+                                "schema": "alg10_global_frontier_v1",
+                                "tier": "global",
+                                "reason": "GLOBAL_TIMEOUT_STREAK",
+                                "candidate_order": CANDIDATE_ORDER,
+                                "sat_budgets": list(SAT_BUDGETS),
+                                "candidates": _candidate_budget_list_for_resume(
+                                    remaining, max_budget_tried
+                                ),
+                            }
+                            timings["SAT"] += time.time() - t_sat
+                            return accepted, telemetry
                         continue
 
                     if result is True:
+                        consecutive_timeouts = 0
                         telemetry["sat"] += 1
                         telemetry["global_sat"] += 1
-                        model = solver.get_model() if (CEX_PRUNING or CEX_POOL) else None
+                        want_model = (
+                            CEX_PRUNING
+                            or CEX_POOL
+                            or GLOBAL_PHASE_MODE in {"model", "controls_false_model"}
+                        )
+                        model = solver.get_model() if want_model else None
+                        if model and GLOBAL_PHASE_MODE in {"model", "controls_false_model"}:
+                            last_phase_model = model
                         if model:
                             _cex_pool_add(
                                 inputs,
@@ -2732,6 +3411,7 @@ def _run_budgeted_global_sat(
                         continue
 
                     telemetry["unsat"] += 1
+                    consecutive_timeouts = 0
                     telemetry["global_unsat"] += 1
                     accepted[idx] = stuck_value
                     if stuck_value == 0:
@@ -3160,6 +3840,32 @@ def _merge_telemetry(total, phase):
     total["cone_unsat"] += phase.get("cone_unsat", 0)
     total["cone_timeouts"] += phase.get("cone_timeouts", 0)
     total["cone_skipped"] += phase.get("cone_skipped", 0)
+    total["cone_partition_checks"] += phase.get("cone_partition_checks", 0)
+    total["cone_partition_sat"] += phase.get("cone_partition_sat", 0)
+    total["cone_partition_unsat"] += phase.get("cone_partition_unsat", 0)
+    total["cone_partition_timeouts"] += phase.get("cone_partition_timeouts", 0)
+    total["cone_partition_groups"] += phase.get("cone_partition_groups", 0)
+    total["cone_partition_audit_fail"] += phase.get("cone_partition_audit_fail", 0)
+    total["cone_partition_skipped"] += phase.get("cone_partition_skipped", 0)
+    total["cone_partition_no_affected"] += phase.get("cone_partition_no_affected", 0)
+    total["cone_partition_below_min_roots"] += phase.get("cone_partition_below_min_roots", 0)
+    total["cone_partition_target_outside_cone"] += phase.get(
+        "cone_partition_target_outside_cone", 0
+    )
+    total["cone_partition_cone_too_large"] += phase.get("cone_partition_cone_too_large", 0)
+    total["cone_partition_fallbacks"] += phase.get("cone_partition_fallbacks", 0)
+    total["cone_partition_max_cone_gates"] = max(
+        total.get("cone_partition_max_cone_gates", 0),
+        phase.get("cone_partition_max_cone_gates", 0),
+    )
+    total["cone_partition_max_seen_cone_gates"] = max(
+        total.get("cone_partition_max_seen_cone_gates", 0),
+        phase.get("cone_partition_max_seen_cone_gates", 0),
+    )
+    total["cone_partition_max_skipped_cone_gates"] = max(
+        total.get("cone_partition_max_skipped_cone_gates", 0),
+        phase.get("cone_partition_max_skipped_cone_gates", 0),
+    )
     total["global_checks"] += phase.get("global_checks", 0)
     total["global_sat"] += phase.get("global_sat", 0)
     total["global_unsat"] += phase.get("global_unsat", 0)
@@ -3277,6 +3983,21 @@ def solve_circuit(circuit_path, output_path):
         "cone_unsat": 0,
         "cone_timeouts": 0,
         "cone_skipped": 0,
+        "cone_partition_checks": 0,
+        "cone_partition_sat": 0,
+        "cone_partition_unsat": 0,
+        "cone_partition_timeouts": 0,
+        "cone_partition_groups": 0,
+        "cone_partition_audit_fail": 0,
+        "cone_partition_skipped": 0,
+        "cone_partition_no_affected": 0,
+        "cone_partition_below_min_roots": 0,
+        "cone_partition_target_outside_cone": 0,
+        "cone_partition_cone_too_large": 0,
+        "cone_partition_fallbacks": 0,
+        "cone_partition_max_cone_gates": 0,
+        "cone_partition_max_seen_cone_gates": 0,
+        "cone_partition_max_skipped_cone_gates": 0,
         "global_checks": 0,
         "global_sat": 0,
         "global_unsat": 0,
@@ -3335,6 +4056,8 @@ def solve_circuit(circuit_path, output_path):
         checkpoint_status_loaded = ""
         checkpoint_json_loaded = ""
         checkpoint_work_loaded = ""
+        checkpoint_source_dir = ""
+        checkpoint_imported_external = 0
 
         if checkpoint is not None:
             checkpoint_work = checkpoint.get("_checkpoint_work_path")
@@ -3342,6 +4065,8 @@ def solve_circuit(circuit_path, output_path):
                 _, checkpoint_work = _checkpoint_paths(circuit_path)
             checkpoint_json_loaded = checkpoint.get("_checkpoint_json_path", "")
             checkpoint_work_loaded = checkpoint_work
+            checkpoint_source_dir = checkpoint.get("_checkpoint_source_dir", "")
+            checkpoint_imported_external = int(checkpoint.get("_checkpoint_imported_external", 0) or 0)
             shutil.copy(checkpoint_work, work_path)
             telemetry["resumed"] = 1
             try:
@@ -3376,49 +4101,58 @@ def solve_circuit(circuit_path, output_path):
 
         status = "RUNNING"
         latest_phase_resume_state = None
-        for _ in range(max(1, MAX_PHASES)):
-            telemetry["phases"] += 1
-            t_parse = time.time()
-            parsed_header, symbols, gates_raw = _parse_current(work_path)
-            timings["Parse"] += time.time() - t_parse
-            _, I, L, O, _, inputs, latches, outputs = parsed_header
-            sweep_roots = list(outputs)
-            sweep_roots.extend(_parse_latch(latch)[1] for latch in latches)
-
-            accepted, phase_telemetry = _run_tiered_sat(
-                inputs,
-                latches,
-                sweep_roots,
-                gates_raw,
-                timings,
-                deadline,
-                phase_resume_state=phase_resume_state,
-            )
-            phase_resume_state = None
-            _merge_telemetry(telemetry, phase_telemetry)
-            latest_phase_resume_state = phase_telemetry.get("_phase_resume_state")
-
-            if accepted:
-                working_gates = _apply_accepts(gates_raw, accepted)
-                _write_strashed(work_path, parsed_header, working_gates, symbols, "Alg10 Rebuild Strash")
-                status = "CHECKPOINTED_AFTER_COMMITS"
-                latest_phase_resume_state = None
-                _save_checkpoint(circuit_path, work_path, telemetry, status)
-
-            abort_reason = phase_telemetry.get("abort_reason", "")
-            if abort_reason in {
-                "TIME_BUDGET_CHECKPOINT",
-                "USER_INTERRUPT_CHECKPOINT",
-                "UNRESOLVED_TIMEOUTS",
-            }:
-                status = abort_reason
-                break
-            if not accepted:
-                status = "COMPLETE"
-                break
+        if checkpoint is not None and checkpoint_status_loaded == "COMPLETE" and checkpoint_start_unresolved == 0:
+            status = "COMPLETE"
+            telemetry["unresolved"] = 0
         else:
-            status = "MAX_PHASES_REACHED"
-            telemetry["abort_reason"] = status
+            for _ in range(max(1, MAX_PHASES)):
+                telemetry["phases"] += 1
+                t_parse = time.time()
+                parsed_header, symbols, gates_raw = _parse_current(work_path)
+                timings["Parse"] += time.time() - t_parse
+                _, I, L, O, _, inputs, latches, outputs = parsed_header
+                sweep_roots = list(outputs)
+                sweep_roots.extend(_parse_latch(latch)[1] for latch in latches)
+
+                accepted, phase_telemetry = _run_tiered_sat(
+                    inputs,
+                    latches,
+                    sweep_roots,
+                    gates_raw,
+                    timings,
+                    deadline,
+                    phase_resume_state=phase_resume_state,
+                )
+                phase_resume_state = None
+                _merge_telemetry(telemetry, phase_telemetry)
+                latest_phase_resume_state = phase_telemetry.get("_phase_resume_state")
+                frontier_unresolved = _phase_resume_unresolved_count(latest_phase_resume_state)
+                if frontier_unresolved is not None:
+                    telemetry["unresolved"] = max(telemetry["unresolved"], frontier_unresolved)
+
+                if accepted:
+                    working_gates = _apply_accepts(gates_raw, accepted)
+                    _write_strashed(
+                        work_path, parsed_header, working_gates, symbols, "Alg10 Rebuild Strash"
+                    )
+                    status = "CHECKPOINTED_AFTER_COMMITS"
+                    latest_phase_resume_state = None
+                    _save_checkpoint(circuit_path, work_path, telemetry, status)
+
+                abort_reason = phase_telemetry.get("abort_reason", "")
+                if abort_reason in {
+                    "TIME_BUDGET_CHECKPOINT",
+                    "USER_INTERRUPT_CHECKPOINT",
+                    "UNRESOLVED_TIMEOUTS",
+                }:
+                    status = abort_reason
+                    break
+                if not accepted:
+                    status = "COMPLETE"
+                    break
+            else:
+                status = "MAX_PHASES_REACHED"
+                telemetry["abort_reason"] = status
 
         shutil.copy(work_path, output_path)
         _save_cex_pool(circuit_path, inputs, latches, telemetry)
@@ -3452,6 +4186,9 @@ def solve_circuit(circuit_path, output_path):
     timings["Checkpoint_Status_Loaded"] = checkpoint_status_loaded
     timings["Checkpoint_JSON_Loaded"] = checkpoint_json_loaded
     timings["Checkpoint_Work_Loaded"] = checkpoint_work_loaded
+    timings["Checkpoint_Source_Dir"] = checkpoint_source_dir
+    timings["Checkpoint_Imported_External"] = checkpoint_imported_external
+    timings["Checkpoint_Select_Policy"] = CHECKPOINT_SELECT_POLICY
     timings["Checkpoint_Start_AND2"] = checkpoint_start_gates if checkpoint_start_gates is not None else ""
     timings["Checkpoint_Start_Removed_AND2"] = (
         max(0, orig_gates - checkpoint_start_gates)
@@ -3496,7 +4233,35 @@ def solve_circuit(circuit_path, output_path):
     timings["Cone_Engine"] = CONE_ENGINE
     timings["Cone_Solver"] = CONE_SOLVER if CONE_ENGINE in {"grouped", "hybrid"} else "single"
     timings["Cone_Group_Min_Size"] = CONE_GROUP_MIN_SIZE
+    timings["Cone_Partition_Size"] = CONE_PARTITION_SIZE
+    timings["Cone_Partition_Min_Roots"] = CONE_PARTITION_MIN_ROOTS
+    timings["Cone_Partition_Max_Gates"] = CONE_PARTITION_MAX_GATES
+    timings["Cone_Partition_Checks"] = telemetry["cone_partition_checks"]
+    timings["Cone_Partition_Query_SAT"] = telemetry["cone_partition_sat"]
+    timings["Cone_Partition_Query_UNSAT"] = telemetry["cone_partition_unsat"]
+    timings["Cone_Partition_Timeouts"] = telemetry["cone_partition_timeouts"]
+    timings["Cone_Partition_Groups"] = telemetry["cone_partition_groups"]
+    timings["Cone_Partition_Audit_Fail"] = telemetry["cone_partition_audit_fail"]
+    timings["Cone_Partition_Skipped"] = telemetry["cone_partition_skipped"]
+    timings["Cone_Partition_No_Affected"] = telemetry["cone_partition_no_affected"]
+    timings["Cone_Partition_Below_Min_Roots"] = telemetry["cone_partition_below_min_roots"]
+    timings["Cone_Partition_Target_Outside_Cone"] = telemetry[
+        "cone_partition_target_outside_cone"
+    ]
+    timings["Cone_Partition_Cone_Too_Large"] = telemetry["cone_partition_cone_too_large"]
+    timings["Cone_Partition_Fallbacks"] = telemetry["cone_partition_fallbacks"]
+    timings["Cone_Partition_Max_Seen_Cone_Gates"] = telemetry[
+        "cone_partition_max_seen_cone_gates"
+    ]
+    timings["Cone_Partition_Max_Skipped_Cone_Gates"] = telemetry[
+        "cone_partition_max_skipped_cone_gates"
+    ]
     timings["Global_Checks"] = telemetry["global_checks"]
+    timings["Global_Solver"] = GLOBAL_SOLVER
+    timings["Global_Max_Consecutive_Timeouts"] = GLOBAL_MAX_CONSEC_TIMEOUTS
+    timings["Global_Frontier_Order"] = GLOBAL_FRONTIER_ORDER
+    timings["Global_Phase_Mode"] = GLOBAL_PHASE_MODE
+    timings["Global_Phase_Model_Limit"] = GLOBAL_PHASE_MODEL_LIMIT
     timings["Global_Query_SAT"] = telemetry["global_sat"]
     timings["Global_Query_UNSAT"] = telemetry["global_unsat"]
     timings["Global_Timeouts"] = telemetry["global_timeouts"]
@@ -3523,6 +4288,8 @@ def solve_circuit(circuit_path, output_path):
     timings["CEX_Pool_Replay_Checked"] = telemetry["cex_pool_replay_checked"]
     timings["CEX_Pool_Replay_Pruned"] = telemetry["cex_pool_replay_pruned"]
     timings["PreSAT_Sim_Enabled"] = int(PRE_SIM_REJECTION)
+    timings["PreSAT_Sim_Engine"] = PRE_SIM_ENGINE
+    timings["PreSAT_Sim_Packed_Max_Bits"] = PRE_SIM_PACKED_MAX_BITS
     timings["PreSAT_Sim_After_TFI"] = int(PRE_SIM_AFTER_TFI)
     timings["PreSAT_Sim_Patterns"] = telemetry["pre_sim_patterns"]
     timings["PreSAT_Sim_Checked"] = telemetry["pre_sim_checked"]
@@ -3565,6 +4332,13 @@ def solve_circuit(circuit_path, output_path):
     timings["Fault_Detection_Events_By_CEX_Prune"] = telemetry["cex_pruned"]
     timings["Fault_Redundancy_Proof_Events_UNSAT"] = (
         telemetry["accepted_sa0"] + telemetry["accepted_sa1"]
+    )
+    timings["Functional_Const_Proofs_TFI"] = telemetry["tfi_unsat"]
+    timings["Exact_Miter_UNSAT_Proofs_Window"] = telemetry["window_unsat"]
+    timings["Exact_Miter_UNSAT_Proofs_Cone"] = telemetry["cone_unsat"]
+    timings["Exact_Miter_UNSAT_Proofs_Global"] = telemetry["global_unsat"]
+    timings["Exact_Miter_UNSAT_Proofs_Total"] = (
+        telemetry["window_unsat"] + telemetry["cone_unsat"] + telemetry["global_unsat"]
     )
 
     removed = max(0, orig_gates - final_gates)

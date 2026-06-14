@@ -218,6 +218,119 @@ The Alg10 24h unresolved-to-zero campaign was stopped at the end of the session.
 Latest checkpoint family:
 
 - Checkpoint dir: `results_optimized/alg10_checkpoints_resume_pool_presim`
+
+## 2026-06-13 Alg10 Frontier Accounting Decision Point
+
+Latest completed overnight run:
+
+- Log: `alg10_best_protected_12h_20260612_214114.log`
+- Report: `results_optimized/thesis_results_ALG10_alg10_strict_audit_zero_resume_pool_presim_current_real_suites_planted_2026-06-12_21-41-14.csv`
+- Finished cleanly; no `main.py` process remained afterward.
+- CEC PASS rows: `144/144`.
+- CEC PASS latest circuits: `38/38`.
+- Total removed latest circuits: `2303` gates.
+- SAT unresolved latest circuits: `116619`.
+- Main remaining latest unresolved circuits: `hyp=50141`, `mem_ctrl=45133`, `log2=10381`, `sqrt=9667`, `div=1254`, `sin=43`.
+- Div checkpoint seeding was fixed: div now starts from `233` removed rather than the weaker `227` removed seed.
+
+Important correction:
+
+- The remembered `voter` unresolved range around `1900` was real historically (`1908`, `2003`, `2211`, etc.).
+- Later checkpoints solved voter: latest useful result is `removed=1509`, `SAT_Unresolved=0`.
+- Do not spend debugging time on voter unless a new run regresses it.
+
+Problem found:
+
+- Some low unresolved numbers from previous summaries were misleading because tier frontier checkpoints stored `pending` and `escalated` lists.
+- The old checkpoint ranking used only `telemetry["unresolved"]`, which could count pending candidates while ignoring escalated candidates.
+- Examples: `sqrt=94` and `hyp=259` were not reliable total-frontier unresolved counts.
+
+Patch made:
+
+- Added `_phase_resume_unresolved_count(state)` in `optimizer_alg10_tiered.py`.
+- Added `_checkpoint_unresolved_from_data(data)`.
+- Checkpoint selection now ranks by true frontier size, using `max(telemetry_unresolved, pending + escalated)` where applicable.
+- Checkpoint saving now stores unresolved as at least the full saved frontier size.
+- External checkpoints keep valid `phase_resume` metadata; validation still requires matching `work_sha256` and `gate_count`.
+- Runtime telemetry is guarded so a saved phase frontier cannot report less unresolved than its true frontier.
+
+Corrected checkpoint selection for remaining hard circuits:
+
+- `hyp`: selects realistic unresolved `946`, valid global frontier.
+- `mem_ctrl`: selects realistic unresolved `8466`, no valid exact frontier.
+- `log2`: selects realistic unresolved `10764`, valid global frontier.
+- `sqrt`: selects realistic unresolved `368`, valid global frontier.
+- `div`: selects realistic unresolved `955`, valid global frontier.
+- `sin`: selects realistic unresolved `16`, valid global frontier.
+
+Tests run after the patch:
+
+- `venv/bin/python -m py_compile optimizer_alg10_tiered.py test_alg10_resume_pool.py main.py`
+- `venv/bin/python -c "import test_alg10_resume_pool as t; t.test_external_checkpoint_preserves_valid_phase_resume(); t.test_checkpoint_rank_counts_tier_pending_and_escalated(); print('new resume/frontier tests passed')"`
+- `venv/bin/python test_alg10_resume_pool.py`
+- `venv/bin/python test_alg10_checkpoint.py`
+- `git diff --check`
+
+All passed.
+
+Review prompt created for outside feedback:
+
+- `LLM_REVIEW_PROMPT_FRONTIER_FIXED_DECISION_2026-06-13.md`
+
+Feedback received:
+
+- Run the patched experiment, but treat it as validation rather than a guaranteed breakthrough.
+- Do not run a full 38-circuit campaign again; split finish-line circuits from heavyweight diagnostics.
+- Add explicit success criteria before running.
+- Preflight `tried_asc` versus `untried_first` on `sin` for 30 minutes.
+- Add invariants for duplicate/overlapping frontier candidates before trusting saved frontier counts.
+- Keep `voter` out of the blocker list; it is already solved.
+
+Follow-up changes made:
+
+- Added `ALG10_GLOBAL_FRONTIER_ORDER=untried_first`; this schedules candidates with no previous budget before tried candidates, then falls back to tried-budget ascending order.
+- Hardened saved frontier validation: duplicate global candidates, duplicate tier candidates, and pending/escalated overlap now invalidate phase-resume metadata and fall back safely.
+- Added `alg10_decision_summary.py` to compare run CSVs against corrected baselines/targets and flag non-informative runs that only skipped already exhausted budgets.
+- Added tests:
+  - `test_tier_frontier_overlap_and_duplicates_are_rejected`
+  - `test_untried_first_global_frontier_order`
+- Added run protocol with thresholds and split commands:
+  - `ALG10_FRONTIER_FIXED_RUN_PROTOCOL_2026-06-13.md`
+
+Preflight outcome on 2026-06-13:
+
+- Commands were launched for `sin` using the default mode budgets (`1000,5000,20000,100000,500000`).
+- Both `tried_asc` and `untried_first` finished quickly and were non-informative.
+- Result for both: `SAT_Unresolved=16`, `Global_Budget_History_Loaded=16`, `Global_Budget_History_Skipped=80`, `Global_Budget_History_Exhausted=16`, `SAT_Checks=0`.
+- Cause: the exact `sin` frontier had already been tried through the configured max budget, so the engine correctly skipped repeated budget work.
+- Protocol updated: use fresh higher budgets (`ALG10_BUDGETS=1000000,2000000,5000000`) for the next preflight and focused finish-line/heavyweight runs.
+- High-budget `sin` preflight finished with useful progress:
+  - Report: `results_optimized/thesis_results_ALG10_alg10_strict_audit_zero_resume_pool_presim_current_custom_only_2026-06-13_11-56-31.csv`
+  - `SAT_Unresolved=13`, improved from corrected baseline `16`.
+  - `SAT_Checks=9`, `SAT_Query_SAT=2`, `SAT_Query_UNSAT=0`, `SAT_Timeouts=7`.
+  - This validates that higher budgets are worth running, but progress is slow and CPU-bound.
+- Added `alg10_parallel_portfolio.py` for safe process-level parallelism:
+  - `finishline`: runs `sin`, `div`, `sqrt`, `hyp`, and `voter` as independent workers.
+  - `heavyweights`: runs `log2` and `mem_ctrl` separately.
+  - `sin-portfolio`: runs multiple global frontier orders for `sin`.
+  - Each worker has its own checkpoint dir and normal CEC verification; use later waves or `ALG10_EXTRA_CHECKPOINT_DIRS` to import the best produced checkpoints.
+- Parallel launcher bug found and fixed:
+  - Bad run: `finishline_parallel_20260613_131546`.
+  - Symptom: huge repeated missing-file loop in `alg10_parallel_finishline_parallel_20260613_131546_sin.log` and a huge shared CSV at `results_optimized/thesis_results_ALG10_alg10_strict_audit_zero_resume_pool_presim_current_custom_only_2026-06-13_13-15-46.csv`.
+  - Root cause: several `main.py` workers started in the same second and shared the same timestamp-derived dataset directory, output directory, and report CSV.
+  - Fix: `main.py` now accepts `THESIS_RUN_TIMESTAMP`, and `alg10_parallel_portfolio.py` gives each worker a unique microsecond timestamp containing the tag and task name.
+  - Additional guard: a fatal per-circuit exception in repeat-until-zero mode now marks that path stalled instead of repeating the same error forever.
+  - Launcher now handles `SIGTERM`/`SIGINT` and terminates active child workers.
+  - Verified with `sin-portfolio` smoke run using two concurrent workers; separate report CSVs were produced.
+  - Verified signal cleanup with `signal_cleanup_smoke`: killing only the launcher terminated both active `main.py` child workers; final process table had no Alg10 workers.
+
+Do not blindly start another 12-hour full-suite run. Follow the protocol:
+
+1. Run preflight tests.
+2. Create split custom suites.
+3. Run 30-minute high-budget `sin` preflight; if ordering ties, prefer `untried_first`.
+4. Run finish-line 12-hour focused campaign, preferably with `alg10_parallel_portfolio.py --scenario finishline --jobs 4`.
+5. Run `log2`/`mem_ctrl` as separate diagnostics.
 - Latest run-local dataset marker: `dataset_2026-05-26_03-02-39`
 - Latest checkpoint timestamp: `2026-05-27 00:09:17`
 - Circuits in marker: 38
@@ -1545,3 +1658,245 @@ circuit-specific profiles:
   unresolved/runtime and sometimes expose a small number of extra removals.
 - `log2`: avoid pre-sim before TFI; use no pre-sim or post-TFI pre-sim so the
   TFI proof tier gets the wall-clock budget.
+
+## 2026-06-13 Intra-Circuit Parallel SAT Frontier Probe
+
+Goal: test the idea of using multiple cores inside one circuit, without
+changing the production optimizer or writing live checkpoints while the
+`finishline_parallel_safe_20260613_132711` campaign was running.
+
+Implementation:
+
+- Added `alg10_frontier_shard_probe.py`.
+- The probe reuses Alg10's existing global SAT encoding and assumption audit.
+- It freezes a work AAG/frontier, shards candidate SAT checks across worker
+  processes, and compares against a serial run.
+- Workers are read-only: no AAG rewrite, no checkpoint save, no CEX save, and
+  no direct gate commit.
+- UNSAT results are labeled `UNSAT_PROPOSED_ACCEPT` only. The transactional
+  coordinator added on 2026-06-14 rechecks and commits these sequentially
+  through the strict audit/CEC path.
+- Added explicit `--checkpoint-json` mode because historical `sin` checkpoints
+  were made from normalized dataset copies whose `source_sha256` differs from
+  the raw benchmark file. Automatic checkpoint loading remains source-hash
+  strict.
+
+Safety checks passed:
+
+- `venv/bin/python -m py_compile alg10_frontier_shard_probe.py test_alg10_frontier_shard_probe.py`
+- `venv/bin/python test_alg10_frontier_shard_probe.py`
+- `git diff --check`
+
+## 2026-06-14 Transactional Parallel Commit Coordinator
+
+Implemented `alg10_parallel_commit_coordinator.py`.
+
+Architecture:
+
+- Worker solvers receive one immutable AAG generation and enqueue
+  `SAT_REJECT`, `TIMEOUT`, or `UNSAT_PROPOSED_ACCEPT` classifications.
+- Workers never write the AAG or checkpoint.
+- The coordinator validates the generation SHA-256 before consuming results.
+- At the generation barrier, it serially rechecks queued UNSAT proposals in one
+  cumulative global-miter solver context.
+- Compatible UNSAT proofs are applied together, forward-strashed, and accepted
+  only after direct ABC CEC returns `PASS`.
+- A failed CEC removes the candidate AAG and leaves the active generation
+  byte-for-byte unchanged.
+- After a commit, the old frontier is discarded because gate indices may have
+  changed; the next generation builds a fresh frontier.
+- Without a commit, SAT rejects are removed from the current frontier, timeout
+  budget history is persisted, and restart resumes at the next candidates.
+- Checkpoints and per-generation JSONL records are written after every wave.
+
+Important boundary:
+
+- Parallelism accelerates classification only.
+- The single coordinator is the sole writer and sole commit authority.
+- The wall-clock limit is checked between generations; an active SAT wave is
+  allowed to return cleanly before exit.
+
+Validation:
+
+- Tiny ODC circuit: worker produced UNSAT proposals, coordinator rechecked and
+  committed a reduction, and direct ABC CEC returned `PASS`.
+- Forced CEC failure: transaction rolled back and the active work-AAG hash was
+  unchanged.
+- `c432` two-generation smoke: generation 2 processed different candidates,
+  proving the in-memory frontier advances.
+- `c432` restart smoke: resumed from the persisted frontier rather than
+  repeating earlier batches; final ABC CEC returned `PASS`.
+- Latch next-state functions were added to the shard probe's observable roots
+  so worker semantics match Algorithm 10's combinational cut-boundary policy.
+
+Checks passed:
+
+- `venv/bin/python -m py_compile alg10_parallel_commit_coordinator.py test_alg10_parallel_commit_coordinator.py alg10_frontier_shard_probe.py`
+- `venv/bin/python test_alg10_parallel_commit_coordinator.py`
+- `venv/bin/python test_alg10_frontier_shard_probe.py`
+- `git diff --check`
+
+### Active 30-Minute Go/No-Go Pilot
+
+Started at `2026-06-14 00:50:52 CEST` as user service:
+
+```text
+alg10-parcommit-sin-30m-20260614-0050.service
+```
+
+Configuration:
+
+- target: `epfl_arithmetic_sin`, corrected frontier `9`, removed `41`;
+- three worker processes plus the coordinator;
+- one generation, three candidates;
+- fresh conflict budget `2,500,000` for candidates previously tried through
+  `2,000,000`;
+- direct ABC CEC required before any commit;
+- nominal generation deadline `1800s`;
+- script: `run_alg10_parallel_commit_sin_30m.sh`;
+- log: `alg10_parallel_commit_sin_30m_20260614_0050.log`;
+- output/report: `results_optimized/parallel_commit_sin_30m_20260614_0050/`;
+- checkpoint dir:
+  `results_optimized/alg10_checkpoints_parallel_commit_sin_30m_20260614_0050/`.
+
+Go/no-go rule:
+
+- Strong go: at least one coordinator-confirmed UNSAT acceptance and CEC
+  `PASS`.
+- Conditional go: useful classifications are persisted, runtime is practical,
+  and no stale/repeated work occurs, but no acceptance is found.
+- No-go for a 12-hour run on this frontier: all candidates time out or are SAT
+  rejects with no accepted reduction.
+
+Sin pilot result:
+
+- finished in `558.06s`;
+- all three fresh `2,500,000`-conflict checks timed out;
+- no UNSAT proposal and no new commit;
+- final direct ABC CEC `PASS`;
+- the nine-candidate frontier and upgraded budget history were persisted;
+- decision: do not spend 12 hours on the exhausted `sin` frontier.
+
+Next pilot:
+
+- target: `epfl_arithmetic_sqrt`, unresolved `368`, removed `54`;
+- script: `run_alg10_parallel_commit_sqrt_30m.sh`;
+- three workers, 12 candidates, fresh `500,000`-conflict budget;
+- most candidates were previously tried only through `100,000`, with eight
+  candidates only through `20,000`;
+- one generation with a nominal 30-minute deadline.
+
+Started at `2026-06-14 01:28:59 CEST` as:
+
+```text
+alg10-parcommit-sqrt-30m-20260614-0129.service
+```
+
+Sqrt pilot result:
+
+- finished in `686.05s`;
+- all 12 fresh `500,000`-conflict checks timed out;
+- no SAT reject, UNSAT proposal, coordinator acceptance, commit, or new
+  reduction;
+- final direct ABC CEC `PASS`;
+- checkpoint persisted under
+  `results_optimized/alg10_checkpoints_parallel_commit_sqrt_30m_20260614_0129/`;
+- decision: do not spend 12 hours on the current global-miter `sqrt` frontier.
+
+Automatic overnight handoff:
+
+- wrapper: `run_alg10_sqrt_pilot_then_12h.sh`;
+- overnight runner: `run_alg10_parallel_commit_sqrt_12h.sh`;
+- waits for the pilot service to stop;
+- requires final CEC `PASS`, zero failed CEC commits, and at least one SAT
+  reject or coordinator-confirmed UNSAT acceptance;
+- all-timeout pilot is a no-go and does not start the 12-hour run;
+- overnight configuration uses three workers, budgets
+  `1,000,000,2,000,000,5,000,000`, batch size `12`, and `43200s`.
+
+The handoff correctly returned `NO-GO`; no overnight service was launched.
+No Algorithm 10, CaDiCaL, or `main.py` experiment process remained running at
+the final check. The next experiment should change the SAT decomposition or
+candidate strategy before increasing the runtime budget.
+
+Probe results:
+
+- `c432`, fresh, 24 candidates, `glucose4`, budget 1000:
+  - serial 0.016s, parallel 0.028s, exact match, 0.58x speedup.
+  - Decision: not useful for easy SAT rejects; overhead dominates.
+- `c432`, fresh, 24 candidates, `cadical153`, model phase, budget 1000:
+  - serial 0.019s, parallel 0.026s, exact match, 0.71x speedup.
+  - Decision: model phase path is tested, but easy candidates are still too
+    cheap for sharding.
+- `sin`, explicit high-budget preflight checkpoint
+  `custom_epfl_arithmetic_sin_b17da687e8a4.json`, dry-run:
+  - loaded valid global checkpoint frontier, 13 candidates available.
+- `sin`, same checkpoint, 4 candidates, `glucose4`, budget 1000:
+  - serial 0.647s, parallel 0.416s, exact match, 1.56x speedup.
+- `sin`, same checkpoint, 8 candidates, `glucose4`, budget 1000:
+  - serial 1.383s, parallel 0.694s, exact match, 1.99x speedup.
+- `sin`, same checkpoint, 8 candidates, `cadical153`, budget 1000:
+  - serial 1.047s, parallel 0.964s, exact match, 1.09x speedup.
+- `sin`, same checkpoint, 8 candidates, `cadical153`, budget 10000, 2 jobs:
+  - serial 11.648s, parallel 6.554s, exact match, 1.78x speedup.
+- `sin`, same checkpoint, 8 candidates, `cadical153`, budget 10000, 4 jobs:
+  - serial 10.796s, parallel 4.007s, exact match, 2.69x speedup.
+
+Decision:
+
+- Intra-circuit parallelism is worth pursuing for hard frontier SAT candidates,
+  especially at nontrivial budgets.
+- It should not replace the current long run today. The current safe campaign
+  is already running and producing CEC PASS cycles.
+- The safe next implementation is a coordinator, not direct parallel commits:
+  freeze frontier, shard SAT classification, merge SAT rejects/timeouts/proposed
+  UNSATs, then sequentially recheck and commit proposed UNSATs through the
+  existing strict audit/CEC pipeline.
+
+## 2026-06-13 Ranked Intra-Circuit Frontier Campaign Runner
+
+Implemented `alg10_ranked_frontier_campaign.py` as the safe 6-hour runner for
+the intra-circuit parallel idea.
+
+Behavior:
+
+- Scans valid Alg10 checkpoint JSON files.
+- Validates that checkpoint `phase_resume.work_sha256`, `phase_resume.gate_count`,
+  checkpoint `current_gates`, and the work-AAG header agree.
+- Deduplicates by normalized circuit name.
+- Sorts targets by lowest true unresolved count, then highest removed-gate
+  count.
+- Runs one circuit at a time, sharding frontier SAT checks across worker
+  processes.
+- Writes JSONL and summary files under `results_optimized/`.
+- Remains read-only: no AAG rewrite, no checkpoint save, no CEX save, and no
+  direct commit.
+
+Real dry-run ranking after the finishline campaign had progressed:
+
+1. `epfl_arithmetic_sin`: unresolved 9, removed 41.
+2. `epfl_arithmetic_sqrt`: unresolved 368, removed 54.
+3. `epfl_arithmetic_hyp`: unresolved 939, removed 4.
+4. `epfl_arithmetic_div`: unresolved 955, removed 233.
+5. `epfl_arithmetic_log2`: unresolved 10764, removed 416.
+6. `epfl_random_control_mem_ctrl`: unresolved 52546, removed 2, valid TFI
+   frontier.
+
+Final probe before implementation:
+
+- `sin`, high-budget preflight checkpoint, 13 candidates, `cadical153`, budget
+  10000, 4 jobs:
+  - serial 16.310s;
+  - parallel 5.090s;
+  - exact match;
+  - 3.20x speedup.
+
+Checks passed:
+
+- `venv/bin/python -m py_compile alg10_ranked_frontier_campaign.py test_alg10_ranked_frontier_campaign.py alg10_frontier_shard_probe.py test_alg10_frontier_shard_probe.py`
+- `venv/bin/python test_alg10_ranked_frontier_campaign.py`
+- `venv/bin/python test_alg10_frontier_shard_probe.py`
+- Ranked campaign smoke:
+  - `sin`, 9 candidates, budget 1000, 2 jobs, exact read-only JSONL/summary
+    output generated.
+- `git diff --check`

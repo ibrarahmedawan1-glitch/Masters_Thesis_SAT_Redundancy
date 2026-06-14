@@ -16,6 +16,24 @@ temp_faulty.aag
 dataset_benchmarks/
 results_optimized/
 
+# Experiment Runtime Artifacts
+*.log
+/temp_mod.aag
+/test_binary.aig
+/test_python_strash_out.aag
+/test_surgery_out.aag
+
+# Local External Benchmark Corpora
+benchmark_suites/IWLS_benchmarks_2005_V_1.0/
+
+# Generated Algorithm 10 Campaign Suites
+custom_circuits/alg10_finishline/
+custom_circuits/alg10_heavyweights/
+custom_circuits/alg10_near_zero_normalized_targets/
+custom_circuits/alg10_near_zero_only/
+custom_circuits/alg10_near_zero_targets/
+custom_circuits/alg10_preflight_sin/
+
 # Temporary Algorithm Files
 *.temp.aag
 *.univ.aag
