@@ -9,6 +9,7 @@ single stuck-at proof obligations faster than one large affected-root miter.
 
 import argparse
 import csv
+import json
 import os
 import time
 from collections import Counter
@@ -171,6 +172,74 @@ def collect_circuits(items):
             seen.add(key)
             circuits.append(candidate)
     return circuits
+
+
+def checkpoint_work_path(data, json_path):
+    raw = str(data.get("work_aag") or "")
+    if not raw:
+        raise ValueError("checkpoint has no work_aag")
+    candidates = [Path(raw)]
+    if not Path(raw).is_absolute():
+        candidates.extend([Path(json_path).resolve().parent / raw, REPO_ROOT / raw])
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    raise ValueError(f"checkpoint work_aag does not exist: {raw}")
+
+
+def load_checkpoint_frontier(json_path, frontier_kind):
+    json_path = resolve_path(json_path)
+    with json_path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    work_path = checkpoint_work_path(data, json_path)
+    parsed = parse_aag(str(work_path))
+    gate_count = parsed[4]
+    phase = data.get("phase_resume")
+    if not isinstance(phase, dict):
+        raise ValueError("checkpoint has no phase_resume frontier")
+    if phase.get("work_sha256") != alg10._sha256_file(str(work_path)):
+        raise ValueError("checkpoint phase work hash does not match work_aag")
+    if int(phase.get("gate_count", -1)) != gate_count:
+        raise ValueError("checkpoint phase gate count does not match work_aag")
+
+    raw_items = []
+    tier = str(phase.get("tier", ""))
+    if tier == "global":
+        raw_items.extend(phase.get("candidates", []))
+    elif tier in {"tfi", "window", "cone"}:
+        if frontier_kind in {"all", "pending"}:
+            raw_items.extend(phase.get("pending", []))
+        if frontier_kind in {"all", "escalated"}:
+            raw_items.extend(phase.get("escalated", []))
+    else:
+        raise ValueError(f"unsupported checkpoint phase tier: {tier}")
+
+    candidates = []
+    history = {}
+    seen = set()
+    for item in raw_items:
+        if not isinstance(item, (list, tuple)) or len(item) not in {2, 3}:
+            raise ValueError("malformed checkpoint candidate")
+        idx, stuck_value = item[0], item[1]
+        tried = item[2] if len(item) == 3 else 0
+        if (
+            not isinstance(idx, int)
+            or not isinstance(stuck_value, int)
+            or not isinstance(tried, int)
+            or idx < 0
+            or idx >= gate_count
+            or stuck_value not in {0, 1}
+        ):
+            raise ValueError("invalid checkpoint candidate")
+        candidate = (idx, stuck_value)
+        if candidate in seen:
+            raise ValueError("duplicate checkpoint candidate")
+        seen.add(candidate)
+        candidates.append(candidate)
+        history[candidate] = max(0, tried)
+    if not candidates:
+        raise ValueError("checkpoint frontier has no candidates")
+    return work_path, candidates, history, tier
 
 
 def observable_roots(outputs, latches):
@@ -484,13 +553,31 @@ def row_for_result(
     }
 
 
-def run_circuit(path, args, detail_writer, summary):
+def run_circuit(
+    path,
+    args,
+    detail_writer,
+    summary,
+    candidate_override=None,
+    history=None,
+):
     M, I, L, O, A, inputs, latches, outputs, gates_raw, _symbols = parse_aag(str(path))
     del M, I, L, O
 
     roots = observable_roots(outputs, latches)
     by_lhs, fanout = alg10._fanout_graph(gates_raw)
-    candidates = alg10._candidate_order(gates_raw, roots=roots)
+    candidates = (
+        list(candidate_override)
+        if candidate_override is not None
+        else alg10._candidate_order(gates_raw, roots=roots)
+    )
+    candidates = alg10._order_global_frontier(
+        candidates,
+        gates_raw,
+        history or {},
+        roots=roots,
+        order=args.candidate_order,
+    )
     stuck_values = set(args.stuck_values)
     deadline = time.time() + args.seconds if args.seconds > 0 else None
 
@@ -578,6 +665,17 @@ def main():
         description="Experiment with affected-root partitioned exact cone miters."
     )
     parser.add_argument("--circuits", nargs="*", default=None)
+    parser.add_argument("--checkpoint-json", default="")
+    parser.add_argument(
+        "--checkpoint-frontier",
+        choices=["all", "pending", "escalated"],
+        default="all",
+    )
+    parser.add_argument(
+        "--candidate-order",
+        choices=["current", "proof_cost", "proof_cost_untried"],
+        default="current",
+    )
     parser.add_argument("--partition-sizes", default="1,2,4,8")
     parser.add_argument("--budget", type=int, default=5000)
     parser.add_argument("--seconds", type=float, default=30.0, help="Per-circuit wall time cap.")
@@ -597,7 +695,19 @@ def main():
     if not args.stuck_values or any(value not in {0, 1} for value in args.stuck_values):
         raise SystemExit("--stuck-values must contain 0, 1, or both")
 
-    circuits = collect_circuits(args.circuits)
+    checkpoint_candidates = None
+    checkpoint_history = None
+    checkpoint_tier = ""
+    if args.checkpoint_json:
+        try:
+            work_path, checkpoint_candidates, checkpoint_history, checkpoint_tier = (
+                load_checkpoint_frontier(args.checkpoint_json, args.checkpoint_frontier)
+            )
+        except Exception as exc:
+            raise SystemExit(f"invalid checkpoint frontier: {exc}") from exc
+        circuits = [work_path]
+    else:
+        circuits = collect_circuits(args.circuits)
     if not circuits:
         raise SystemExit("no circuits found")
 
@@ -611,6 +721,12 @@ def main():
 
     print("Partitioned exact miter experiment")
     print(f"  circuits={len(circuits)}")
+    if args.checkpoint_json:
+        print(
+            f"  checkpoint={resolve_path(args.checkpoint_json)} "
+            f"tier={checkpoint_tier} frontier={len(checkpoint_candidates)}"
+        )
+    print(f"  candidate_order={args.candidate_order}")
     print(f"  output_dir={output_dir}")
     print(f"  detail={detail_path}")
 
@@ -624,7 +740,14 @@ def main():
         detail_writer = csv.DictWriter(f, fieldnames=DETAIL_FIELDS)
         detail_writer.writeheader()
         for circuit in circuits:
-            scanned, evaluated, mismatches = run_circuit(circuit, args, detail_writer, summary)
+            scanned, evaluated, mismatches = run_circuit(
+                circuit,
+                args,
+                detail_writer,
+                summary,
+                candidate_override=checkpoint_candidates,
+                history=checkpoint_history,
+            )
             total_scanned += scanned
             total_evaluated += evaluated
             total_mismatches += mismatches

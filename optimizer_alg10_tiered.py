@@ -16,6 +16,10 @@ The new contribution is scheduling and persistence:
 - candidates are retried with increasing conflict budgets;
 - hard/time-limited circuits write the latest safe optimized AAG;
 - a checkpoint work AAG allows the next run to resume from that safe state.
+
+Experimental exact cone engines also include affected-root partitions and a
+single-fault TFO slice. They remain opt-in and preserve the same UNSAT-only
+acceptance boundary.
 """
 
 import glob
@@ -99,7 +103,15 @@ WINDOW_MAX_CONE_GATES = int(
 )
 CONE_MITER = os.environ.get("ALG10_CONE_MITER", "1") != "0"
 CONE_ENGINE = os.environ.get("ALG10_CONE_ENGINE", "single").strip().lower()
-if CONE_ENGINE not in {"single", "grouped", "hybrid", "partitioned", "hybrid_partitioned"}:
+if CONE_ENGINE not in {
+    "single",
+    "grouped",
+    "hybrid",
+    "partitioned",
+    "hybrid_partitioned",
+    "tfo",
+    "hybrid_tfo",
+}:
     CONE_ENGINE = "single"
 CONE_SOLVER = os.environ.get("ALG10_CONE_SOLVER", "cadical153").strip() or "cadical153"
 CONE_GROUP_MIN_SIZE = max(1, int(os.environ.get("ALG10_CONE_GROUP_MIN_SIZE", "8")))
@@ -115,6 +127,14 @@ CONE_MAX_GATES = int(
 CONE_PARTITION_MAX_GATES = max(
     0,
     int(os.environ.get("ALG10_CONE_PARTITION_MAX_GATES", str(CONE_MAX_GATES))),
+)
+CONE_TFO_MAX_GOOD_GATES = max(
+    0,
+    int(os.environ.get("ALG10_CONE_TFO_MAX_GOOD_GATES", "0")),
+)
+CONE_TFO_MAX_FAULTY_GATES = max(
+    0,
+    int(os.environ.get("ALG10_CONE_TFO_MAX_FAULTY_GATES", "20000")),
 )
 GLOBAL_MITER = os.environ.get("ALG10_GLOBAL_MITER", "1") != "0"
 GLOBAL_SOLVER = os.environ.get("ALG10_GLOBAL_SOLVER", "glucose4").strip() or "glucose4"
@@ -135,6 +155,9 @@ if GLOBAL_FRONTIER_ORDER not in {
     "depth_asc",
     "fanout_desc",
     "fanout_asc",
+    "proof_cost",
+    "proof_cost_untried",
+    "proof_reverse_portfolio",
     "stuck0_first",
     "stuck1_first",
     "random",
@@ -780,8 +803,67 @@ def _candidate_order(gates_raw, roots=None):
     return sorted(candidates, key=key)
 
 
-def _order_global_frontier(candidates, gates_raw, max_budget_tried):
-    order = GLOBAL_FRONTIER_ORDER
+def _observable_proof_costs(gates_raw, roots):
+    """Estimate exact-partition SAT cost without filtering any candidate."""
+    gate_count = len(gates_raw)
+    if not gate_count or not roots:
+        return [(0, 0, 0) for _ in gates_raw]
+
+    by_lhs, fanout = _fanout_graph(gates_raw)
+    direct_root_bits = [0 for _ in gates_raw]
+    root_cone_sizes = []
+    cone_size_cache = {}
+
+    for root_pos, root in enumerate(roots):
+        base = root & ~1
+        root_idx = by_lhs.get(base)
+        if root_idx is None:
+            root_cone_sizes.append(0)
+            continue
+        direct_root_bits[root_idx] |= 1 << root_pos
+        if base not in cone_size_cache:
+            cone_size_cache[base] = len(
+                _fanin_indices_for_roots(gates_raw, [root], by_lhs=by_lhs)
+            )
+        root_cone_sizes.append(cone_size_cache[base])
+
+    affected_bits = direct_root_bits[:]
+    for idx in range(gate_count - 1, -1, -1):
+        bits = affected_bits[idx]
+        for child in fanout[idx]:
+            bits |= affected_bits[child]
+        affected_bits[idx] = bits
+
+    metric_cache = {0: (0, 0, 0)}
+    costs = []
+    for bits in affected_bits:
+        metric = metric_cache.get(bits)
+        if metric is None:
+            count = bits.bit_count()
+            max_cone = 0
+            total_cone = 0
+            remaining = bits
+            while remaining:
+                low_bit = remaining & -remaining
+                root_pos = low_bit.bit_length() - 1
+                cone_size = root_cone_sizes[root_pos]
+                max_cone = max(max_cone, cone_size)
+                total_cone += cone_size
+                remaining ^= low_bit
+            metric = (max_cone, count, total_cone)
+            metric_cache[bits] = metric
+        costs.append(metric)
+    return costs
+
+
+def _order_global_frontier(
+    candidates,
+    gates_raw,
+    max_budget_tried,
+    roots=None,
+    order=None,
+):
+    order = (order or GLOBAL_FRONTIER_ORDER).strip().lower()
     items = list(candidates)
     if order == "current":
         return items
@@ -791,10 +873,27 @@ def _order_global_frontier(candidates, gates_raw, max_budget_tried):
         return items
 
     depth, fanout = _gate_depth_fanout(gates_raw)
+    proof_costs = None
+    if order in {"proof_cost", "proof_cost_untried", "proof_reverse_portfolio"}:
+        proof_costs = _observable_proof_costs(gates_raw, roots)
 
     def key(item):
         idx, value = item
         tried = max_budget_tried.get((idx, value), 0)
+        if proof_costs is not None:
+            max_partition_cone, affected_roots, total_partition_cone = proof_costs[idx]
+            cost = (
+                max_partition_cone,
+                affected_roots,
+                total_partition_cone,
+                fanout[idx],
+                -depth[idx],
+                idx,
+                value,
+            )
+            if order == "proof_cost_untried":
+                return (1 if tried > 0 else 0, tried) + cost
+            return cost + (tried,)
         if order == "untried_first":
             return (1 if tried > 0 else 0, tried, idx, value)
         if order == "tried_asc":
@@ -818,6 +917,22 @@ def _order_global_frontier(candidates, gates_raw, max_budget_tried):
         if order == "stuck1_first":
             return (-value, idx)
         return (idx, value)
+
+    if order == "proof_reverse_portfolio":
+        proof_ranked = sorted(items, key=key)
+        reverse_ranked = sorted(items, key=lambda item: (-item[0], item[1]))
+        merged = []
+        seen = set()
+        for pos in range(max(len(proof_ranked), len(reverse_ranked))):
+            for ranked in (proof_ranked, reverse_ranked):
+                if pos >= len(ranked):
+                    continue
+                candidate = ranked[pos]
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                merged.append(candidate)
+        return merged
 
     return sorted(items, key=key)
 
@@ -868,6 +983,14 @@ def _empty_phase_telemetry():
         "cone_partition_max_cone_gates": 0,
         "cone_partition_max_seen_cone_gates": 0,
         "cone_partition_max_skipped_cone_gates": 0,
+        "cone_tfo_checks": 0,
+        "cone_tfo_sat": 0,
+        "cone_tfo_unsat": 0,
+        "cone_tfo_timeouts": 0,
+        "cone_tfo_skipped": 0,
+        "cone_tfo_audit_fail": 0,
+        "cone_tfo_max_good_gates": 0,
+        "cone_tfo_max_faulty_gates": 0,
         "global_checks": 0,
         "global_sat": 0,
         "global_unsat": 0,
@@ -1903,6 +2026,240 @@ def _partitioned_cone_miter_check(
     return "UNSAT", None
 
 
+def _observable_tfo_slice(fanout, target_idx, good_cone):
+    relevant = set(good_cone)
+    tfo = set()
+    stack = [target_idx]
+    while stack:
+        idx = stack.pop()
+        if idx not in relevant or idx in tfo:
+            continue
+        tfo.add(idx)
+        for child in fanout[idx]:
+            if child in relevant:
+                stack.append(child)
+    return tfo
+
+
+def _fanin_dependency_tfo_slice(by_lhs, gates_raw, target_idx, good_cone):
+    """Derive target dependence from fanins, independently of the fanout walk."""
+    good_cone = set(good_cone)
+    dependent = set()
+    for idx in sorted(good_cone):
+        if idx == target_idx:
+            dependent.add(idx)
+            continue
+        _, r0, r1 = gates_raw[idx]
+        if any(by_lhs.get(lit & ~1) in dependent for lit in (r0, r1)):
+            dependent.add(idx)
+    return dependent
+
+
+def _audit_tfo_slice(
+    by_lhs,
+    fanout,
+    affected_roots,
+    target_idx,
+    good_cone,
+    tfo_slice,
+    gates_raw=None,
+):
+    good_cone = set(good_cone)
+    tfo_slice = set(tfo_slice)
+    if target_idx not in good_cone or target_idx not in tfo_slice:
+        raise AssertionError("TFO slice does not contain the target")
+
+    expected = _observable_tfo_slice(fanout, target_idx, good_cone)
+    if tfo_slice != expected:
+        missing = sorted(expected - tfo_slice)
+        extra = sorted(tfo_slice - expected)
+        raise AssertionError(
+            f"TFO slice mismatch; missing={missing[:10]}, extra={extra[:10]}"
+        )
+
+    if gates_raw is not None:
+        independent = _fanin_dependency_tfo_slice(
+            by_lhs,
+            gates_raw,
+            target_idx,
+            good_cone,
+        )
+        if not independent.issubset(tfo_slice):
+            missing = sorted(independent - tfo_slice)
+            raise AssertionError(
+                "TFO fanin-dependency audit mismatch; "
+                f"missing={missing[:10]}"
+            )
+
+    for root in affected_roots:
+        root_idx = by_lhs.get(root & ~1)
+        if root_idx is None or root_idx not in tfo_slice:
+            raise AssertionError(f"affected root {root} is outside the TFO slice")
+
+
+def _build_single_fault_tfo_miter(
+    inputs,
+    latches,
+    roots,
+    gates_raw,
+    target_idx,
+    stuck_value,
+    good_cone,
+    tfo_slice,
+):
+    """Encode one exact fault using a good cone and only its faulty TFO slice."""
+    cnf = _CNFBuilder()
+    shared = {}
+    good = {}
+    faulty = {}
+
+    for lit in inputs:
+        shared[lit >> 1] = cnf.new_var()
+    for latch in latches:
+        shared[_parse_latch(latch)[0] >> 1] = cnf.new_var()
+
+    def good_lit(aig_lit):
+        if aig_lit == 0:
+            return cnf.const(False)
+        if aig_lit == 1:
+            return cnf.const(True)
+        var = aig_lit >> 1
+        if var in good:
+            sat_lit = good[var]
+        elif var in shared:
+            sat_lit = shared[var]
+        else:
+            raise ValueError(f"undefined literal in good TFO encoding: {aig_lit}")
+        return -sat_lit if (aig_lit & 1) else sat_lit
+
+    def faulty_lit(aig_lit):
+        if aig_lit == 0:
+            return cnf.const(False)
+        if aig_lit == 1:
+            return cnf.const(True)
+        var = aig_lit >> 1
+        if var in faulty:
+            sat_lit = faulty[var]
+        elif var in good:
+            sat_lit = good[var]
+        elif var in shared:
+            sat_lit = shared[var]
+        else:
+            raise ValueError(f"undefined literal in faulty TFO encoding: {aig_lit}")
+        return -sat_lit if (aig_lit & 1) else sat_lit
+
+    for idx in sorted(good_cone):
+        lhs, r0, r1 = gates_raw[idx]
+        good_out = cnf.new_var()
+        good[lhs >> 1] = good_out
+        cnf.and2(good_out, good_lit(r0), good_lit(r1))
+
+    for idx in sorted(tfo_slice):
+        lhs, r0, r1 = gates_raw[idx]
+        if idx == target_idx:
+            faulty[lhs >> 1] = cnf.const(bool(stuck_value))
+            continue
+        faulty_out = cnf.new_var()
+        faulty[lhs >> 1] = faulty_out
+        cnf.and2(faulty_out, faulty_lit(r0), faulty_lit(r1))
+
+    xors = []
+    for root in roots:
+        xor = cnf.new_var()
+        cnf.xor2(xor, good_lit(root), faulty_lit(root))
+        xors.append(xor)
+    return cnf.clauses, cnf.or_many(xors), shared
+
+
+def _tfo_miter_check(
+    inputs,
+    latches,
+    outputs,
+    gates_raw,
+    target_idx,
+    stuck_value,
+    timings,
+    by_lhs,
+    fanout,
+    telemetry=None,
+):
+    affected = _affected_roots_from_graph(by_lhs, fanout, outputs, target_idx)
+    if not affected:
+        if telemetry is not None:
+            telemetry["cone_tfo_skipped"] += 1
+        return "SKIP", None
+
+    good_cone = _fanin_indices_for_roots(gates_raw, affected, by_lhs=by_lhs)
+    tfo_slice = _observable_tfo_slice(fanout, target_idx, good_cone)
+    try:
+        _audit_tfo_slice(
+            by_lhs,
+            fanout,
+            affected,
+            target_idx,
+            good_cone,
+            tfo_slice,
+            gates_raw,
+        )
+    except AssertionError:
+        if telemetry is not None:
+            telemetry["cone_tfo_audit_fail"] += 1
+            telemetry["cone_tfo_skipped"] += 1
+        return "SKIP", None
+
+    if telemetry is not None:
+        telemetry["cone_tfo_max_good_gates"] = max(
+            telemetry["cone_tfo_max_good_gates"], len(good_cone)
+        )
+        telemetry["cone_tfo_max_faulty_gates"] = max(
+            telemetry["cone_tfo_max_faulty_gates"], len(tfo_slice)
+        )
+    if CONE_TFO_MAX_GOOD_GATES > 0 and len(good_cone) > CONE_TFO_MAX_GOOD_GATES:
+        if telemetry is not None:
+            telemetry["cone_tfo_skipped"] += 1
+        return "SKIP", None
+    if CONE_TFO_MAX_FAULTY_GATES > 0 and len(tfo_slice) > CONE_TFO_MAX_FAULTY_GATES:
+        if telemetry is not None:
+            telemetry["cone_tfo_skipped"] += 1
+        return "SKIP", None
+
+    t_encode = time.time()
+    clauses, miter_lit, shared = _build_single_fault_tfo_miter(
+        inputs,
+        latches,
+        affected,
+        gates_raw,
+        target_idx,
+        stuck_value,
+        good_cone,
+        tfo_slice,
+    )
+    timings["Encode"] += time.time() - t_encode
+
+    t_sat = time.time()
+    with Solver(name=CONE_SOLVER, bootstrap_with=clauses) as solver:
+        result = _solve_limited_with_budget(solver, [miter_lit], CONE_BUDGET)
+        model = solver.get_model() if result is True and (CEX_PRUNING or CEX_POOL) else None
+    timings["SAT"] += time.time() - t_sat
+
+    if telemetry is not None:
+        telemetry["cone_tfo_checks"] += 1
+    if result is None:
+        if telemetry is not None:
+            telemetry["cone_tfo_timeouts"] += 1
+        return "TIMEOUT", None
+    if result is False:
+        if telemetry is not None:
+            telemetry["cone_tfo_unsat"] += 1
+        return "UNSAT", None
+    if telemetry is not None:
+        telemetry["cone_tfo_sat"] += 1
+    primary_values = (
+        _model_primary_values_from_shared(inputs, latches, model, shared) if model else None
+    )
+    return "SAT", primary_values
+
+
 def _bounded_tfo_window_roots(by_lhs, fanout, observable_roots, gates_raw, target_idx, levels):
     if levels < 0:
         return []
@@ -2290,6 +2647,7 @@ def _run_cone_miter_tier(
 
     grouped_enabled = CONE_ENGINE in {"grouped", "hybrid"}
     partitioned_enabled = CONE_ENGINE in {"partitioned", "hybrid_partitioned"}
+    tfo_enabled = CONE_ENGINE in {"tfo", "hybrid_tfo"}
     group_keys = {}
     group_cones = {}
     group_sizes = {}
@@ -2381,7 +2739,32 @@ def _run_cone_miter_tier(
             if idx in accepted or cand in pruned:
                 continue
 
-            if partitioned_enabled:
+            if tfo_enabled:
+                result, primary_values = _tfo_miter_check(
+                    inputs,
+                    latches,
+                    outputs,
+                    working_gates,
+                    idx,
+                    stuck_value,
+                    timings,
+                    by_lhs,
+                    fanout,
+                    telemetry=telemetry,
+                )
+                if result == "SKIP" and CONE_ENGINE == "hybrid_tfo":
+                    result, primary_values = _cone_miter_check(
+                        inputs,
+                        latches,
+                        outputs,
+                        working_gates,
+                        idx,
+                        stuck_value,
+                        timings,
+                        by_lhs,
+                        fanout,
+                    )
+            elif partitioned_enabled:
                 result, primary_values = _partitioned_cone_miter_check(
                     inputs,
                     latches,
@@ -3273,7 +3656,12 @@ def _run_budgeted_global_sat(
     if not unresolved:
         telemetry["unresolved"] = 0
         return accepted, telemetry
-    unresolved = _order_global_frontier(unresolved, gates_raw, max_budget_tried)
+    unresolved = _order_global_frontier(
+        unresolved,
+        gates_raw,
+        max_budget_tried,
+        roots=outputs,
+    )
 
     t_sat = time.time()
     try:
@@ -3866,6 +4254,20 @@ def _merge_telemetry(total, phase):
         total.get("cone_partition_max_skipped_cone_gates", 0),
         phase.get("cone_partition_max_skipped_cone_gates", 0),
     )
+    total["cone_tfo_checks"] += phase.get("cone_tfo_checks", 0)
+    total["cone_tfo_sat"] += phase.get("cone_tfo_sat", 0)
+    total["cone_tfo_unsat"] += phase.get("cone_tfo_unsat", 0)
+    total["cone_tfo_timeouts"] += phase.get("cone_tfo_timeouts", 0)
+    total["cone_tfo_skipped"] += phase.get("cone_tfo_skipped", 0)
+    total["cone_tfo_audit_fail"] += phase.get("cone_tfo_audit_fail", 0)
+    total["cone_tfo_max_good_gates"] = max(
+        total.get("cone_tfo_max_good_gates", 0),
+        phase.get("cone_tfo_max_good_gates", 0),
+    )
+    total["cone_tfo_max_faulty_gates"] = max(
+        total.get("cone_tfo_max_faulty_gates", 0),
+        phase.get("cone_tfo_max_faulty_gates", 0),
+    )
     total["global_checks"] += phase.get("global_checks", 0)
     total["global_sat"] += phase.get("global_sat", 0)
     total["global_unsat"] += phase.get("global_unsat", 0)
@@ -3998,6 +4400,14 @@ def solve_circuit(circuit_path, output_path):
         "cone_partition_max_cone_gates": 0,
         "cone_partition_max_seen_cone_gates": 0,
         "cone_partition_max_skipped_cone_gates": 0,
+        "cone_tfo_checks": 0,
+        "cone_tfo_sat": 0,
+        "cone_tfo_unsat": 0,
+        "cone_tfo_timeouts": 0,
+        "cone_tfo_skipped": 0,
+        "cone_tfo_audit_fail": 0,
+        "cone_tfo_max_good_gates": 0,
+        "cone_tfo_max_faulty_gates": 0,
         "global_checks": 0,
         "global_sat": 0,
         "global_unsat": 0,
@@ -4231,7 +4641,11 @@ def solve_circuit(circuit_path, output_path):
     timings["Cone_Timeouts"] = telemetry["cone_timeouts"]
     timings["Cone_Skipped"] = telemetry["cone_skipped"]
     timings["Cone_Engine"] = CONE_ENGINE
-    timings["Cone_Solver"] = CONE_SOLVER if CONE_ENGINE in {"grouped", "hybrid"} else "single"
+    timings["Cone_Solver"] = (
+        CONE_SOLVER
+        if CONE_ENGINE in {"grouped", "hybrid", "tfo", "hybrid_tfo"}
+        else "single"
+    )
     timings["Cone_Group_Min_Size"] = CONE_GROUP_MIN_SIZE
     timings["Cone_Partition_Size"] = CONE_PARTITION_SIZE
     timings["Cone_Partition_Min_Roots"] = CONE_PARTITION_MIN_ROOTS
@@ -4256,6 +4670,16 @@ def solve_circuit(circuit_path, output_path):
     timings["Cone_Partition_Max_Skipped_Cone_Gates"] = telemetry[
         "cone_partition_max_skipped_cone_gates"
     ]
+    timings["Cone_TFO_Max_Good_Gates_Config"] = CONE_TFO_MAX_GOOD_GATES
+    timings["Cone_TFO_Max_Faulty_Gates_Config"] = CONE_TFO_MAX_FAULTY_GATES
+    timings["Cone_TFO_Checks"] = telemetry["cone_tfo_checks"]
+    timings["Cone_TFO_Query_SAT"] = telemetry["cone_tfo_sat"]
+    timings["Cone_TFO_Query_UNSAT"] = telemetry["cone_tfo_unsat"]
+    timings["Cone_TFO_Timeouts"] = telemetry["cone_tfo_timeouts"]
+    timings["Cone_TFO_Skipped"] = telemetry["cone_tfo_skipped"]
+    timings["Cone_TFO_Audit_Fail"] = telemetry["cone_tfo_audit_fail"]
+    timings["Cone_TFO_Max_Good_Gates"] = telemetry["cone_tfo_max_good_gates"]
+    timings["Cone_TFO_Max_Faulty_Gates"] = telemetry["cone_tfo_max_faulty_gates"]
     timings["Global_Checks"] = telemetry["global_checks"]
     timings["Global_Solver"] = GLOBAL_SOLVER
     timings["Global_Max_Consecutive_Timeouts"] = GLOBAL_MAX_CONSEC_TIMEOUTS

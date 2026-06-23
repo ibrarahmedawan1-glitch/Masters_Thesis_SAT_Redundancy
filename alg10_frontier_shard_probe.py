@@ -6,6 +6,11 @@ splits candidate SAT checks across worker processes, and compares the result
 against a serial run.  Workers never rewrite the AAG, never save checkpoints,
 and never commit UNSAT candidates.  An UNSAT result here is only a proposal
 that a future audited coordinator would need to recheck sequentially.
+
+The default ``global`` engine shares one configurable full-circuit miter per
+worker.  The ``tfo`` engine instead builds one exact, closure-audited TFO-slice
+miter per candidate, which makes candidate checks independent and suitable for
+parallel process sharding.
 """
 
 from __future__ import annotations
@@ -16,6 +21,7 @@ import json
 import os
 import sys
 import time
+from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -50,6 +56,15 @@ class Alg10Config:
     frontier_order: str = "untried_first"
     solver: str = "cadical153"
     phase_mode: str = "none"
+    engine: str = "global"
+    worker_cache_entries: int = 0
+
+
+def _validate_engine(engine: str) -> str:
+    engine = str(engine).strip().lower()
+    if engine not in {"global", "tfo"}:
+        raise ValueError(f"unsupported frontier probe engine: {engine}")
+    return engine
 
 
 def _set_alg10_env(config: Alg10Config) -> None:
@@ -71,6 +86,87 @@ def _load_alg10(config: Alg10Config):
     if "optimizer_alg10_tiered" in sys.modules:
         return importlib.reload(sys.modules["optimizer_alg10_tiered"])
     return importlib.import_module("optimizer_alg10_tiered")
+
+
+def _load_alg10_worker(config: Alg10Config):
+    """Load one immutable optimizer generation per worker configuration."""
+    _set_alg10_env(config)
+    signature = (
+        config.frontier_order,
+        config.solver,
+        config.phase_mode,
+        config.engine,
+        config.worker_cache_entries,
+    )
+    module = sys.modules.get("optimizer_alg10_tiered")
+    if module is None:
+        module = importlib.import_module("optimizer_alg10_tiered")
+    elif getattr(module, "_ALG10_WORKER_SIGNATURE", None) != signature:
+        module = importlib.reload(module)
+    module._ALG10_WORKER_SIGNATURE = signature
+    return module
+
+
+_WORKER_CIRCUIT_CACHE: "OrderedDict[Tuple[Any, ...], Dict[str, Any]]" = OrderedDict()
+
+
+def clear_worker_circuit_cache() -> None:
+    _WORKER_CIRCUIT_CACHE.clear()
+
+
+def _worker_cache_key(work_path: str) -> Tuple[Any, ...]:
+    stat = os.stat(work_path)
+    return (
+        os.path.abspath(work_path),
+        int(stat.st_dev),
+        int(stat.st_ino),
+        int(stat.st_size),
+        int(stat.st_mtime_ns),
+    )
+
+
+def _load_worker_circuit(opt, work_path: str, config: Alg10Config) -> Tuple[Dict[str, Any], bool]:
+    cache_entries = max(0, int(getattr(config, "worker_cache_entries", 0) or 0))
+    if cache_entries <= 0:
+        parsed = opt.parse_aag(work_path)
+        _, _, _, _, _, inputs, latches, outputs, gates_raw, _ = parsed
+        sweep_roots = _sweep_roots(opt, latches, outputs)
+        by_lhs, fanout = opt._fanout_graph(gates_raw)
+        return {
+            "parsed": parsed,
+            "inputs": inputs,
+            "latches": latches,
+            "outputs": outputs,
+            "gates_raw": gates_raw,
+            "sweep_roots": sweep_roots,
+            "by_lhs": by_lhs,
+            "fanout": fanout,
+        }, False
+
+    key = _worker_cache_key(work_path)
+    cached = _WORKER_CIRCUIT_CACHE.get(key)
+    if cached is not None:
+        _WORKER_CIRCUIT_CACHE.move_to_end(key)
+        return cached, True
+
+    parsed = opt.parse_aag(work_path)
+    _, _, _, _, _, inputs, latches, outputs, gates_raw, _ = parsed
+    sweep_roots = _sweep_roots(opt, latches, outputs)
+    by_lhs, fanout = opt._fanout_graph(gates_raw)
+    cached = {
+        "parsed": parsed,
+        "inputs": inputs,
+        "latches": latches,
+        "outputs": outputs,
+        "gates_raw": gates_raw,
+        "sweep_roots": sweep_roots,
+        "by_lhs": by_lhs,
+        "fanout": fanout,
+    }
+    _WORKER_CIRCUIT_CACHE[key] = cached
+    while len(_WORKER_CIRCUIT_CACHE) > cache_entries:
+        _WORKER_CIRCUIT_CACHE.popitem(last=False)
+    return cached, False
 
 
 def _as_abs(path: str) -> str:
@@ -112,9 +208,17 @@ def _ordered_candidates(
     candidates: Sequence[Candidate],
     gates_raw: Sequence[Sequence[int]],
     max_budget_tried: Dict[Candidate, int],
+    roots=None,
 ) -> List[Candidate]:
     if hasattr(opt, "_order_global_frontier"):
-        return list(opt._order_global_frontier(candidates, gates_raw, max_budget_tried))
+        return list(
+            opt._order_global_frontier(
+                candidates,
+                gates_raw,
+                max_budget_tried,
+                roots=roots,
+            )
+        )
     return list(candidates)
 
 
@@ -144,6 +248,7 @@ def load_frontier(
     checkpoint_source_dir = ""
     phase_tier = ""
     phase_valid = False
+    history_engine = "global"
     max_budget_tried: Dict[Candidate, int] = {}
 
     if checkpoint:
@@ -166,6 +271,10 @@ def load_frontier(
             phase_tier = "global"
             candidates = list(phase.get("candidates", []))
             max_budget_tried = dict(phase.get("max_budget_tried", {}))
+            raw_phase = checkpoint.get("phase_resume") or {}
+            history_engine = str(raw_phase.get("history_engine", "global"))
+            if _validate_engine(config.engine) != history_engine:
+                max_budget_tried = {}
             frontier_source = (
                 "checkpoint_global_frontier_direct"
                 if explicit_checkpoint
@@ -196,7 +305,13 @@ def load_frontier(
         candidates = opt._candidate_order(gates_raw, roots=sweep_roots)
         frontier_source = "fresh_all_candidates"
 
-    candidates = _ordered_candidates(opt, candidates, gates_raw, max_budget_tried)
+    candidates = _ordered_candidates(
+        opt,
+        candidates,
+        gates_raw,
+        max_budget_tried,
+        roots=sweep_roots,
+    )
     available_before_budget = len(candidates)
     skipped_by_budget = 0
     if skip_already_tried and budget > 0:
@@ -223,6 +338,7 @@ def load_frontier(
         "frontier_source": frontier_source,
         "phase_valid": phase_valid,
         "phase_tier": phase_tier,
+        "history_engine": history_engine,
         "candidate_count_available": available_before_budget,
         "candidate_count_after_budget": len(candidates) + skipped_by_budget,
         "candidate_count_tested": len(candidates),
@@ -240,6 +356,70 @@ def split_shards(items: Sequence[WorkItem], jobs: int) -> List[List[WorkItem]]:
     return [shard for shard in shards if shard]
 
 
+def _solver_conflicts(solver) -> int:
+    try:
+        return int(solver.accum_stats().get("conflicts", 0))
+    except Exception:
+        return 0
+
+
+def _budget_targets(primary_budget: int, ladder: Sequence[int]) -> Tuple[int, ...]:
+    targets = [int(value) for value in ladder if int(value) > 0]
+    if not targets and int(primary_budget) > 0:
+        targets = [int(primary_budget)]
+    if not targets:
+        return (0,)
+    result: List[int] = []
+    for target in targets:
+        if not result or target > result[-1]:
+            result.append(target)
+    return tuple(result)
+
+
+def _solve_tfo_ladder(opt, solver, miter_lit: int, targets: Sequence[int]) -> Tuple[Optional[bool], int, List[Dict[str, Any]]]:
+    attempts: List[Dict[str, Any]] = []
+    conflict_base = _solver_conflicts(solver)
+    for target in targets:
+        target = int(target)
+        if target <= 0:
+            started = time.perf_counter()
+            raw = solver.solve(assumptions=[miter_lit])
+            attempts.append(
+                {
+                    "target": 0,
+                    "granted": 0,
+                    "status": "SAT" if raw else "UNSAT",
+                    "seconds": time.perf_counter() - started,
+                    "conflicts": max(0, _solver_conflicts(solver) - conflict_base),
+                }
+            )
+            return raw, 0, attempts
+        consumed = max(0, _solver_conflicts(solver) - conflict_base)
+        granted = max(0, target - consumed)
+        started = time.perf_counter()
+        result = opt._solve_limited_with_budget(solver, [miter_lit], granted)
+        elapsed = time.perf_counter() - started
+        consumed_after = max(0, _solver_conflicts(solver) - conflict_base)
+        if result is True:
+            status = "SAT"
+        elif result is False:
+            status = "UNSAT"
+        else:
+            status = "TIMEOUT"
+        attempts.append(
+            {
+                "target": target,
+                "granted": granted,
+                "status": status,
+                "seconds": elapsed,
+                "conflicts": consumed_after,
+            }
+        )
+        if result is not None:
+            return result, target, attempts
+    return None, int(targets[-1]) if targets else 0, attempts
+
+
 def _solve_items(
     work_path: str,
     items: Sequence[WorkItem],
@@ -247,11 +427,113 @@ def _solve_items(
     config: Alg10Config,
     audit_assumptions: bool,
     worker_id: int,
+    budget_ladder: Sequence[int] = (),
 ) -> List[Dict[str, Any]]:
-    opt = _load_alg10(config)
-    parsed = opt.parse_aag(work_path)
-    _, _, _, _, _, inputs, latches, outputs, gates_raw, _ = parsed
-    sweep_roots = _sweep_roots(opt, latches, outputs)
+    opt = _load_alg10_worker(config)
+    circuit, cache_hit = _load_worker_circuit(opt, work_path, config)
+    inputs = circuit["inputs"]
+    latches = circuit["latches"]
+    gates_raw = circuit["gates_raw"]
+    sweep_roots = circuit["sweep_roots"]
+    engine = _validate_engine(config.engine)
+    targets = _budget_targets(budget, budget_ladder)
+    if engine == "tfo":
+        by_lhs = circuit["by_lhs"]
+        fanout = circuit["fanout"]
+        results: List[Dict[str, Any]] = []
+        for ordinal, idx, stuck_value in items:
+            started = time.perf_counter()
+            affected = opt._affected_roots_from_graph(
+                by_lhs,
+                fanout,
+                sweep_roots,
+                idx,
+            )
+            if not affected:
+                results.append(
+                    {
+                        "ordinal": int(ordinal),
+                        "idx": int(idx),
+                        "stuck_value": int(stuck_value),
+                        "status": STATUS_UNSAT_PROPOSED,
+                        "seconds": time.perf_counter() - started,
+                        "worker": int(worker_id),
+                        "engine": engine,
+                        "affected_roots": 0,
+                        "good_cone_gates": 0,
+                        "faulty_tfo_gates": 0,
+                        "clauses": 0,
+                        "structurally_unobservable": True,
+                        "model_phase_updated": False,
+                        "worker_cache_hit": bool(cache_hit),
+                    }
+                )
+                continue
+
+            good_cone = opt._fanin_indices_for_roots(
+                gates_raw,
+                affected,
+                by_lhs=by_lhs,
+            )
+            tfo_slice = opt._observable_tfo_slice(
+                fanout,
+                idx,
+                good_cone,
+            )
+            opt._audit_tfo_slice(
+                by_lhs,
+                fanout,
+                affected,
+                idx,
+                good_cone,
+                tfo_slice,
+                gates_raw,
+            )
+            clauses, miter_lit, _shared = opt._build_single_fault_tfo_miter(
+                inputs,
+                latches,
+                affected,
+                gates_raw,
+                idx,
+                stuck_value,
+                good_cone,
+                tfo_slice,
+            )
+            with opt.Solver(name=config.solver, bootstrap_with=clauses) as solver:
+                sat_result, budget_tried, attempts = _solve_tfo_ladder(
+                    opt,
+                    solver,
+                    miter_lit,
+                    targets,
+                )
+            if sat_result is True:
+                status = STATUS_SAT_REJECT
+            elif sat_result is False:
+                status = STATUS_UNSAT_PROPOSED
+            else:
+                status = STATUS_TIMEOUT
+            results.append(
+                {
+                    "ordinal": int(ordinal),
+                    "idx": int(idx),
+                    "stuck_value": int(stuck_value),
+                    "status": status,
+                    "seconds": time.perf_counter() - started,
+                    "worker": int(worker_id),
+                    "engine": engine,
+                    "affected_roots": len(affected),
+                    "good_cone_gates": len(good_cone),
+                    "faulty_tfo_gates": len(tfo_slice),
+                    "clauses": len(clauses),
+                    "structurally_unobservable": False,
+                    "model_phase_updated": False,
+                    "worker_cache_hit": bool(cache_hit),
+                    "budget_tried": int(budget_tried),
+                    "budget_attempts": attempts,
+                }
+            )
+        return results
+
     clauses, miter_lit, f0_lits, f1_lits = opt._build_fault_sweep_cnf(
         inputs, latches, sweep_roots, gates_raw
     )
@@ -309,7 +591,10 @@ def _solve_items(
                     "status": status,
                     "seconds": elapsed,
                     "worker": int(worker_id),
+                    "engine": engine,
+                    "clauses": len(clauses),
                     "model_phase_updated": model_used,
+                    "worker_cache_hit": bool(cache_hit),
                 }
             )
     return results
@@ -421,6 +706,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--budget", type=int, default=1000, help="SAT conflict budget")
     parser.add_argument("--solver", default="cadical153", help="PySAT solver name")
     parser.add_argument(
+        "--engine",
+        default="global",
+        choices=["global", "tfo"],
+        help="worker SAT encoding: shared full global miter or exact TFO slice",
+    )
+    parser.add_argument(
         "--phase-mode",
         default="none",
         choices=["none", "controls_false", "model", "controls_false_model"],
@@ -485,6 +776,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         frontier_order=args.order,
         solver=args.solver,
         phase_mode=args.phase_mode,
+        engine=args.engine,
     )
     frontier = load_frontier(
         args.circuit,
@@ -501,6 +793,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "budget": args.budget,
             "jobs": args.jobs,
             "solver": args.solver,
+            "engine": args.engine,
             "phase_mode": args.phase_mode,
             "frontier_order": args.order,
             "audit_assumptions": not args.no_audit,
@@ -537,6 +830,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         report["serial"] = {
             "seconds": serial["seconds"],
             "counts": status_counts(serial["results"]),
+            "results": serial["results"],
         }
         print(
             "Serial:",
@@ -549,6 +843,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "seconds": parallel["seconds"],
         "counts": status_counts(parallel["results"]),
         "shards": parallel["shards"],
+        "results": parallel["results"],
     }
     print(
         "Parallel:",

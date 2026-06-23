@@ -205,6 +205,184 @@ Use partitioned mode as an experiment first. It is exact only because every
 affected observable root is audited into exactly one partition; any SAT rejects,
 all-UNSAT accepts, and timeout remains unresolved.
 
+## Exact TFO-Slice Miter Experiment
+
+Compare the existing monolithic exact cone with a good-cone plus faulty-TFO
+encoding on a saved frontier:
+
+```bash
+venv/bin/python tfo_miter_experiment.py \
+  --checkpoint-json results_optimized/alg10_checkpoints_parallel_finishline_parallel_safe_20260613_132711_sin/custom_epfl_arithmetic_sin_b17da687e8a4.json \
+  --candidate-order proof_reverse_portfolio \
+  --solver cadical153 \
+  --budget 10000 \
+  --max-candidates 9 \
+  --seconds 180
+```
+
+Exercise the optional production cone engine:
+
+```bash
+ALG10_CONE_ENGINE=tfo \
+ALG10_CONE_SOLVER=cadical153 \
+ALG10_CONE_TFO_MAX_GOOD_GATES=0 \
+ALG10_CONE_TFO_MAX_FAULTY_GATES=20000 \
+venv/bin/python main.py
+```
+
+The TFO engine is exact because it encodes the complete good fanin cone of all
+affected real observables and duplicates every relevant gate from the target
+through those observables. Its runtime audit recomputes that slice and rejects
+missing or extra gates before SAT. Only UNSAT accepts; SAT rejects; timeout or
+skip escalates.
+
+Probe the same frozen frontier with serial and multi-process exact TFO workers:
+
+```bash
+venv/bin/python alg10_frontier_shard_probe.py \
+  results_optimized/datasets/dataset_2026-06-13_13-27-11-814736_finishline_parallel_safe_20260613_132711_sin/custom_epfl_arithmetic_sin.aag \
+  --checkpoint-json results_optimized/alg10_checkpoints_parallel_finishline_parallel_safe_20260613_132711_sin/custom_epfl_arithmetic_sin_b17da687e8a4.json \
+  --engine tfo \
+  --limit 9 \
+  --budget 10000 \
+  --jobs 4 \
+  --solver cadical153 \
+  --order proof_reverse_portfolio \
+  --json-out results_optimized/tfo_parallel_probe_sin_20260614.json
+```
+
+Run the single-writer transactional coordinator with parallel TFO workers and
+sequential TFO rechecks:
+
+```bash
+venv/bin/python alg10_parallel_commit_coordinator.py \
+  results_optimized/datasets/dataset_2026-06-13_13-27-11-814736_finishline_parallel_safe_20260613_132711_sin/custom_epfl_arithmetic_sin.aag \
+  results_optimized/parallel_tfo_sin_20260614/custom_epfl_arithmetic_sin_tfo.aag \
+  --checkpoint-dir results_optimized/alg10_checkpoints_parallel_tfo_sin_20260614 \
+  --checkpoint-json results_optimized/alg10_checkpoints_parallel_finishline_parallel_safe_20260613_132711_sin/custom_epfl_arithmetic_sin_b17da687e8a4.json \
+  --worker-engine tfo \
+  --recheck-engine tfo \
+  --jobs 4 \
+  --budgets 10000 \
+  --batch-size 9 \
+  --max-generations 1 \
+  --recheck-budget 0 \
+  --cec-timeout 120
+```
+
+TFO conflict-budget history is stored separately from global-miter history, so
+an old global timeout cannot suppress a new TFO query. Workers only propose;
+the coordinator rechecks proposals sequentially against the progressively
+updated generation and requires full ABC CEC before replacing the work AAG.
+
+Run the four-hour post-commit `sin` pilot with escalating TFO budgets:
+
+```bash
+RUN_TAG=sin_tfo_4h_$(date +%Y%m%d_%H%M%S) \
+  bash run_alg10_parallel_tfo_sin_4h.sh
+```
+
+The worker ladder is `10k,50k,250k,1M,5M` conflicts. A timeout at an early
+tier is not terminal: the candidate remains checkpointed and advances to the
+next budget. Coordinator rechecks are unlimited and every committed generation
+still requires full CEC.
+
+Run the six-hour hard-benchmark campaign from the best corrected checkpoints:
+
+```bash
+RUN_TAG=benchmarks_tfo_6h_$(date +%Y%m%d_%H%M%S) \
+  bash run_alg10_parallel_tfo_benchmarks_6h.sh
+```
+
+The launcher now uses one global dynamic pool across `sin`, `sqrt`, `hyp`,
+`div`, `log2`, and `mem_ctrl`. A free worker pulls the next eligible TFO
+microbatch from any circuit instead of waiting for a circuit-sized visit to
+finish. Circuits with fewer active tasks receive workers first; within a
+circuit, untried candidates precede timeout retries. After the fixed
+`10k,50k,250k,1M,5M` ladder, timeout candidates return to the queue at generated
+budgets `10M,20M,40M,...`.
+
+Each circuit still has an independent work AAG and checkpoint directory. An
+UNSAT proposal pauses new dispatches only for that circuit, waits for its
+same-generation tasks, then enters an asynchronous sequential-recheck and ABC
+CEC barrier. The barrier consumes one slot from the same global worker budget,
+so unrelated circuits continue without CPU oversubscription. Every committed
+generation regenerates only that circuit's frontier.
+
+Worker count is hardware-aware: `--jobs 0` uses the visible physical-core count
+while respecting logical-CPU and available-memory limits. A new campaign
+searches both top-level and earlier nested campaign checkpoint directories,
+then keeps the lowest-gate valid checkpoint for each circuit before considering
+frontier size. It also recognizes prior campaign outputs with
+`final_verify=PASS`; if a commit ended before a new exact frontier was
+serialized, that verified output is independently CEC-checked again, becomes
+the next seed, and has its frontier regenerated.
+
+Resume/adaptation rules:
+
+- unchanged work AAG: resume the exact saved candidate frontier and TFO conflict
+  history;
+- timeout: retain the candidate and retry it at the next larger budget;
+- SAT: reject that stuck-at candidate and continue the saved frontier;
+- CEC-passed commit: keep the lower-gate AAG and regenerate its frontier,
+  because gate indices changed;
+- CEC failure or coordinator error: stop that target for audit.
+
+Workers share queue ownership, timeout history, classifications, and committed
+checkpoints through the single coordinator. They do not share learned SAT
+clauses: candidate-local TFO instances have different CNFs, so direct clause
+exchange is not currently sound or implemented.
+
+The final `summary.json` records `max_active_workers`, classification and
+proposal-barrier busy seconds, dispatch reasons, and measured worker
+utilization. In-flight SAT calls are drained safely after the nominal deadline,
+so a single exact query can still finish slightly after the requested duration.
+
+## Exact Hard-Candidate Strategy Order Experiment
+
+Compare fresh solver restarts with learned-clause retention across increasing
+budgets, while testing every order of exact TFO, output-partitioned TFO, and
+the full affected-root cone:
+
+```bash
+venv/bin/python hard_candidate_strategy_experiment.py \
+  --checkpoint-json results_optimized/alg10_checkpoints_parallel_tfo_sin_4h_20260614_202340/custom_epfl_arithmetic_sin_b17da687e8a4.json \
+  --checkpoint-frontier all \
+  --candidate-order proof_reverse_portfolio \
+  --strategies tfo,partition_tfo,cone \
+  --modes fresh,persistent \
+  --orders all \
+  --budgets 1000,5000,20000 \
+  --partition-size 1 \
+  --max-candidates 20 \
+  --seconds 1800
+```
+
+The runner is read-only. It measures each exact encoding once per candidate
+and solver-state mode, then replays all six stop-on-first-proof orders from the
+same measurements. Persistent mode keeps one solver and learned clauses across
+the cumulative conflict targets. Fresh mode creates a new solver at every
+tier. `partition_tfo` exactly partitions affected observable roots, audits the
+partition and every TFO slice, and returns UNSAT only when every group is
+UNSAT. Any resolved SAT/UNSAT disagreement between encodings aborts the run.
+
+Use `strategy_detail_*.csv` for encoding size, conflict, and persistence
+analysis. Use `portfolio_summary_*.csv` to rank orders first by resolved
+candidates and then by total time. Clause retention is local to one unchanged
+candidate CNF; clauses are not exchanged between different encodings or
+workers.
+
+Available experimental global frontier orders:
+
+```bash
+ALG10_GLOBAL_FRONTIER_ORDER=proof_cost
+ALG10_GLOBAL_FRONTIER_ORDER=proof_cost_untried
+ALG10_GLOBAL_FRONTIER_ORDER=proof_reverse_portfolio
+```
+
+These modes only reorder candidates. They never filter the frontier or change
+the fault-control assumptions.
+
 ## Pair Stuck-At Experiment
 
 Run the bounded pair-miter soundness check before any benchmark experiment:

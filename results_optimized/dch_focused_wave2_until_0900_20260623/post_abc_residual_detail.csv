@@ -1,0 +1,6 @@
+Flow,Circuit,Starting_Gates,Final_Gates,Residual_Gates_Removed,Candidate_Results,SAT_Reject,UNSAT_Proposed,Timeout,Coordinator_UNSAT_Accept,CEC_Pass_Commits,CEC_Failed_Commits,Worker_Errors,Remaining_Obligations,Status,Output
+dch,epfl_arithmetic_bar,4934,2952,1982,5916,5910,6,0,3,1,0,0,0,COMPLETE,/home/ibrar/MyThesis/results_optimized/dch_focused_wave2_until_0900_20260623/dch/dch_epfl_arithmetic_bar/dch_epfl_arithmetic_bar.aag
+dch,epfl_arithmetic_div,34913,31200,3713,68114,52316,9,15789,6,4,0,0,17207,TIME_BUDGET_CHECKPOINT,/home/ibrar/MyThesis/results_optimized/dch_focused_wave2_until_0900_20260623/dch/dch_epfl_arithmetic_div/dch_epfl_arithmetic_div.aag
+dch,epfl_arithmetic_sin,8920,5009,3911,39435,36291,10,3134,8,7,0,0,245,UNRESOLVED_BUDGETS_EXHAUSTED,/home/ibrar/MyThesis/results_optimized/dch_focused_wave2_until_0900_20260623/dch/dch_epfl_arithmetic_sin/dch_epfl_arithmetic_sin.aag
+dch,epfl_arithmetic_square,26121,16642,9479,170986,170958,11,17,9,6,0,0,0,COMPLETE,/home/ibrar/MyThesis/results_optimized/dch_focused_wave2_until_0900_20260623/dch/dch_epfl_arithmetic_square/dch_epfl_arithmetic_square.aag
+dch,epfl_random_control_i2c,2663,1092,1571,2192,2186,6,0,3,1,0,0,0,COMPLETE,/home/ibrar/MyThesis/results_optimized/dch_focused_wave2_until_0900_20260623/dch/dch_epfl_random_control_i2c/dch_epfl_random_control_i2c.aag

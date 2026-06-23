@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import tempfile
+from unittest import mock
 
 import alg10_frontier_shard_probe as probe
 
@@ -133,11 +134,158 @@ def test_unsat_results_are_labeled_as_proposals():
         assert "UNSAT_ACCEPT" not in statuses
 
 
+def test_tfo_serial_parallel_matches_full_global_miter():
+    src = os.path.abspath("benchmarks/c17.aag")
+    before = sha256_file(src)
+    with tempfile.TemporaryDirectory(prefix="alg10_probe_tfo_") as tmp:
+        common = {
+            "checkpoint_dir": os.path.join(tmp, "ckpt"),
+            "extra_checkpoint_dirs": (),
+            "frontier_order": "current",
+            "solver": "glucose4",
+            "phase_mode": "none",
+        }
+        tfo_config = probe.Alg10Config(**common, engine="tfo")
+        global_config = probe.Alg10Config(**common, engine="global")
+        frontier = probe.load_frontier(src, tfo_config, limit=8, use_checkpoint=False)
+
+        serial_tfo = probe.run_serial(
+            frontier["work_path"],
+            frontier["work_items"],
+            0,
+            tfo_config,
+        )
+        parallel_tfo = probe.run_parallel(
+            frontier["work_path"],
+            frontier["work_items"],
+            0,
+            tfo_config,
+            jobs=2,
+        )
+        full_global = probe.run_serial(
+            frontier["work_path"],
+            frontier["work_items"],
+            0,
+            global_config,
+        )
+
+        parallel_match = probe.compare_results(
+            serial_tfo["results"],
+            parallel_tfo["results"],
+        )
+        full_match = probe.compare_results(
+            full_global["results"],
+            serial_tfo["results"],
+        )
+        assert parallel_match["match"], parallel_match
+        assert full_match["match"], full_match
+        assert all(item["engine"] == "tfo" for item in serial_tfo["results"])
+        assert all(item["clauses"] >= 0 for item in serial_tfo["results"])
+
+    assert sha256_file(src) == before
+
+
+def test_worker_optimizer_is_cached_until_semantics_change():
+    config = probe.Alg10Config(
+        checkpoint_dir="/tmp/alg10_worker_cache_test",
+        extra_checkpoint_dirs=(),
+        frontier_order="current",
+        solver="glucose4",
+        phase_mode="none",
+        engine="tfo",
+    )
+    probe._load_alg10_worker(config)
+    with mock.patch.object(
+        probe.importlib,
+        "reload",
+        wraps=probe.importlib.reload,
+    ) as reload_mock:
+        probe._load_alg10_worker(config)
+        assert reload_mock.call_count == 0
+
+        changed = probe.Alg10Config(
+            checkpoint_dir=config.checkpoint_dir,
+            extra_checkpoint_dirs=(),
+            frontier_order="proof_reverse_portfolio",
+            solver=config.solver,
+            phase_mode=config.phase_mode,
+            engine=config.engine,
+        )
+        probe._load_alg10_worker(changed)
+        assert reload_mock.call_count == 1
+
+
+def test_worker_circuit_cache_hits_and_invalidates_on_replace():
+    src = os.path.abspath("benchmarks/c17.aag")
+    with tempfile.TemporaryDirectory(prefix="alg10_probe_cache_") as tmp:
+        work = os.path.join(tmp, "work.aag")
+        shutil.copyfile(src, work)
+        config = probe.Alg10Config(
+            checkpoint_dir=os.path.join(tmp, "ckpt"),
+            extra_checkpoint_dirs=(),
+            frontier_order="current",
+            solver="glucose4",
+            phase_mode="none",
+            engine="tfo",
+            worker_cache_entries=2,
+        )
+        frontier = probe.load_frontier(work, config, limit=4, use_checkpoint=False)
+        probe.clear_worker_circuit_cache()
+        first = probe.run_serial(work, frontier["work_items"], 1000, config)
+        second = probe.run_serial(work, frontier["work_items"], 1000, config)
+        assert not any(item.get("worker_cache_hit") for item in first["results"])
+        assert all(item.get("worker_cache_hit") for item in second["results"])
+
+        tmp_work = os.path.join(tmp, "replacement.aag")
+        shutil.copyfile(src, tmp_work)
+        os.replace(tmp_work, work)
+        third = probe.run_serial(work, frontier["work_items"], 1000, config)
+        assert not any(item.get("worker_cache_hit") for item in third["results"])
+
+
+def test_tfo_persistent_ladder_matches_single_large_budget():
+    src = os.path.abspath("benchmarks/c17.aag")
+    with tempfile.TemporaryDirectory(prefix="alg10_probe_ladder_") as tmp:
+        config = probe.Alg10Config(
+            checkpoint_dir=os.path.join(tmp, "ckpt"),
+            extra_checkpoint_dirs=(),
+            frontier_order="current",
+            solver="glucose4",
+            phase_mode="none",
+            engine="tfo",
+        )
+        frontier = probe.load_frontier(src, config, limit=8, use_checkpoint=False)
+        direct = probe._solve_items(
+            frontier["work_path"],
+            frontier["work_items"],
+            1000,
+            config,
+            True,
+            worker_id=0,
+        )
+        ladder = probe._solve_items(
+            frontier["work_path"],
+            frontier["work_items"],
+            100,
+            config,
+            True,
+            worker_id=0,
+            budget_ladder=(100, 1000),
+        )
+        comparison = probe.compare_results(direct, ladder)
+        assert comparison["match"], comparison
+        assert all("budget_attempts" in item for item in ladder if item["engine"] == "tfo")
+
+
 def run_all():
     test_split_shards_is_complete_and_disjoint()
     test_fresh_serial_parallel_match_without_writes()
     test_checkpoint_global_frontier_is_loaded_read_only()
     test_unsat_results_are_labeled_as_proposals()
+    test_tfo_serial_parallel_matches_full_global_miter()
+    test_worker_optimizer_is_cached_until_semantics_change()
+    test_worker_circuit_cache_hits_and_invalidates_on_replace()
+    test_tfo_persistent_ladder_matches_single_large_budget()
     print("alg10 frontier shard probe tests passed")
 
 

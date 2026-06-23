@@ -77,8 +77,12 @@ def test_enhanced_resume_progress_and_pool_are_safe():
         assert second["status"] == "PASS"
         assert second["resumed"] == 1
         assert second["pool_loaded"] > 0
-        assert second["pool_replay_patterns"] > 0
-        assert second["pool_replay_pruned"] > 0
+        if first["unresolved"] > 0:
+            assert second["pool_replay_patterns"] > 0
+            assert second["pool_replay_pruned"] > 0
+        else:
+            assert second["checks"] == 0
+            assert second["pool_replay_patterns"] == 0
         assert second["final"] <= first["final"]
         assert second["removed"] >= first["removed"]
         _assert_progress_columns(second)

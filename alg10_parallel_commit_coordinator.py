@@ -16,6 +16,7 @@ import os
 import shutil
 import tempfile
 import time
+import math
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -30,6 +31,7 @@ Candidate = Tuple[int, int]
 class CoordinatorConfig:
     checkpoint_dir: str
     extra_checkpoint_dirs: Tuple[str, ...] = ()
+    checkpoint_select: str = "unresolved"
     jobs: int = 3
     budgets: Tuple[int, ...] = (1000, 5000, 20000)
     batch_size: int = 16
@@ -38,10 +40,16 @@ class CoordinatorConfig:
     solver: str = "cadical153"
     phase_mode: str = "none"
     frontier_order: str = "untried_first"
+    worker_engine: str = "global"
+    recheck_engine: str = "global"
     recheck_budget: int = 0
+    continue_until_deadline: bool = False
+    budget_growth: float = 2.0
+    max_generated_budget: int = 0
     checkpoint_json: str = ""
     audit_assumptions: bool = True
     cec_timeout: float = 60.0
+    worker_cache_entries: int = 0
 
 
 def _parse_budgets(raw: str) -> Tuple[int, ...]:
@@ -71,13 +79,17 @@ def _append_jsonl(path: str, data: Dict[str, Any]) -> None:
 
 def _alg10_config(config: CoordinatorConfig) -> probe.Alg10Config:
     os.environ["ALG10_BUDGETS"] = ",".join(str(value) for value in config.budgets)
+    probe._validate_engine(config.worker_engine)
+    probe._validate_engine(config.recheck_engine)
     return probe.Alg10Config(
         checkpoint_dir=config.checkpoint_dir,
         extra_checkpoint_dirs=config.extra_checkpoint_dirs,
-        checkpoint_select="unresolved",
+        checkpoint_select=config.checkpoint_select,
         frontier_order=config.frontier_order,
         solver=config.solver,
         phase_mode=config.phase_mode,
+        engine=config.worker_engine,
+        worker_cache_entries=max(0, int(config.worker_cache_entries)),
     )
 
 
@@ -104,20 +116,39 @@ def _load_checkpoint_data(
     return data
 
 
-def _frontier_from_state(opt, work_path: str, phase_state) -> Tuple[List[Candidate], Dict[Candidate, int]]:
+def _frontier_from_state(
+    opt,
+    work_path: str,
+    phase_state,
+    history_engine: str = "global",
+) -> Tuple[List[Candidate], Dict[Candidate, int]]:
     _, _, _, _, _, _, latches, outputs, gates_raw, _ = opt.parse_aag(work_path)
+    roots = probe._sweep_roots(opt, latches, outputs)
     valid = opt._valid_phase_resume_state(phase_state, work_path, len(gates_raw))
     if valid and valid.get("tier") == "global":
         candidates = list(valid.get("candidates", []))
         history = dict(valid.get("max_budget_tried", {}))
+        stored_engine = (
+            str(phase_state.get("history_engine", "global"))
+            if isinstance(phase_state, dict)
+            else "global"
+        )
+        if stored_engine != history_engine:
+            history = {}
     elif valid and valid.get("tier") in {"tfi", "window", "cone"}:
         candidates = list(valid.get("pending", [])) + list(valid.get("escalated", []))
         history = {}
     else:
-        roots = probe._sweep_roots(opt, latches, outputs)
         candidates = opt._candidate_order(gates_raw, roots=roots)
         history = {}
-    candidates = list(opt._order_global_frontier(candidates, gates_raw, history))
+    candidates = list(
+        opt._order_global_frontier(
+            candidates,
+            gates_raw,
+            history,
+            roots=roots,
+        )
+    )
     return candidates, history
 
 
@@ -127,6 +158,7 @@ def _phase_state(
     candidates: Sequence[Candidate],
     history: Dict[Candidate, int],
     reason: str,
+    history_engine: str = "global",
 ):
     state = {
         "schema": "alg10_global_frontier_v1",
@@ -134,6 +166,7 @@ def _phase_state(
         "reason": reason,
         "candidate_order": opt.CANDIDATE_ORDER,
         "sat_budgets": list(opt.SAT_BUDGETS),
+        "history_engine": history_engine,
         "candidates": opt._candidate_budget_list_for_resume(candidates, history),
     }
     state["work_sha256"] = opt._sha256_file(work_path)
@@ -141,7 +174,185 @@ def _phase_state(
     return state
 
 
-def _serial_recheck(
+def _select_budget_batch(
+    candidates: Sequence[Candidate],
+    history: Dict[Candidate, int],
+    budgets: Sequence[int],
+    batch_size: int,
+    continue_until_deadline: bool = False,
+    budget_growth: float = 2.0,
+    max_generated_budget: int = 0,
+) -> Dict[str, Any]:
+    """Select the next frontier pass while deferring timed-out survivors."""
+    batch_size = max(1, int(batch_size))
+    for budget in budgets:
+        eligible = [
+            candidate
+            for candidate in candidates
+            if int(budget) > history.get(candidate, 0)
+        ]
+        if not eligible:
+            continue
+        next_budget = next(
+            (int(value) for value in budgets if int(value) > int(budget)),
+            0,
+        )
+        return {
+            "budget": int(budget),
+            "batch": eligible[:batch_size],
+            "eligible_count": len(eligible),
+            "deferred_count": len(candidates) - len(eligible),
+            "next_budget": next_budget,
+            "generated_budget": False,
+        }
+    if candidates and continue_until_deadline:
+        if budget_growth <= 1.0:
+            raise ValueError("budget_growth must be greater than 1")
+        configured_max = max((int(value) for value in budgets), default=0)
+        history_floor = min(history.get(candidate, 0) for candidate in candidates)
+        base = max(configured_max, history_floor)
+        generated = max(base + 1, int(math.ceil(base * budget_growth)))
+        if max_generated_budget > 0:
+            generated = min(generated, int(max_generated_budget))
+        eligible = [
+            candidate
+            for candidate in candidates
+            if generated > history.get(candidate, 0)
+        ]
+        if eligible:
+            following = max(
+                generated + 1,
+                int(math.ceil(generated * budget_growth)),
+            )
+            if max_generated_budget > 0:
+                following = min(following, int(max_generated_budget))
+                if following <= generated:
+                    following = 0
+            return {
+                "budget": generated,
+                "batch": eligible[:batch_size],
+                "eligible_count": len(eligible),
+                "deferred_count": len(candidates) - len(eligible),
+                "next_budget": following,
+                "generated_budget": True,
+            }
+    return {
+        "budget": 0,
+        "batch": [],
+        "eligible_count": 0,
+        "deferred_count": len(candidates),
+        "next_budget": 0,
+        "generated_budget": False,
+    }
+
+
+def _serial_recheck_tfo(
+    work_path: str,
+    proposals: Sequence[Dict[str, Any]],
+    config: CoordinatorConfig,
+) -> Dict[str, Any]:
+    alg_config = _alg10_config(config)
+    opt = probe._load_alg10(alg_config)
+    _, _, _, _, _, inputs, latches, outputs, gates_raw, _ = opt.parse_aag(work_path)
+    roots = probe._sweep_roots(opt, latches, outputs)
+    working_gates = [list(gate) for gate in gates_raw]
+    accepted: Dict[int, int] = {}
+    results: List[Dict[str, Any]] = []
+
+    for proposal in sorted(proposals, key=lambda item: item["ordinal"]):
+        idx = int(proposal["idx"])
+        stuck_value = int(proposal["stuck_value"])
+        started = time.perf_counter()
+        metadata: Dict[str, Any] = {"engine": "tfo"}
+        if idx in accepted:
+            status = "STALE_SAME_GATE"
+        else:
+            by_lhs, fanout = opt._fanout_graph(working_gates)
+            affected = opt._affected_roots_from_graph(
+                by_lhs,
+                fanout,
+                roots,
+                idx,
+            )
+            metadata["affected_roots"] = len(affected)
+            if not affected:
+                sat_result = False
+                metadata.update(
+                    {
+                        "good_cone_gates": 0,
+                        "faulty_tfo_gates": 0,
+                        "clauses": 0,
+                        "structurally_unobservable": True,
+                    }
+                )
+            else:
+                good_cone = opt._fanin_indices_for_roots(
+                    working_gates,
+                    affected,
+                    by_lhs=by_lhs,
+                )
+                tfo_slice = opt._observable_tfo_slice(
+                    fanout,
+                    idx,
+                    good_cone,
+                )
+                opt._audit_tfo_slice(
+                    by_lhs,
+                    fanout,
+                    affected,
+                    idx,
+                    good_cone,
+                    tfo_slice,
+                    working_gates,
+                )
+                clauses, miter_lit, _shared = opt._build_single_fault_tfo_miter(
+                    inputs,
+                    latches,
+                    affected,
+                    working_gates,
+                    idx,
+                    stuck_value,
+                    good_cone,
+                    tfo_slice,
+                )
+                metadata.update(
+                    {
+                        "good_cone_gates": len(good_cone),
+                        "faulty_tfo_gates": len(tfo_slice),
+                        "clauses": len(clauses),
+                        "structurally_unobservable": False,
+                    }
+                )
+                with opt.Solver(name=config.solver, bootstrap_with=clauses) as solver:
+                    sat_result = opt._solve_limited_with_budget(
+                        solver,
+                        [miter_lit],
+                        config.recheck_budget,
+                    )
+
+            if sat_result is False:
+                status = "UNSAT_ACCEPT"
+                accepted[idx] = stuck_value
+                lhs = working_gates[idx][0]
+                working_gates[idx] = [lhs, stuck_value, stuck_value]
+            elif sat_result is True:
+                status = "SAT_REJECT"
+            else:
+                status = "TIMEOUT"
+        results.append(
+            {
+                "ordinal": int(proposal["ordinal"]),
+                "idx": idx,
+                "stuck_value": stuck_value,
+                "status": status,
+                "seconds": time.perf_counter() - started,
+                **metadata,
+            }
+        )
+    return {"accepted": accepted, "results": results}
+
+
+def _serial_recheck_global(
     work_path: str,
     proposals: Sequence[Dict[str, Any]],
     config: CoordinatorConfig,
@@ -207,9 +418,20 @@ def _serial_recheck(
                     "stuck_value": stuck_value,
                     "status": status,
                     "seconds": time.time() - started,
+                    "engine": "global",
                 }
             )
     return {"accepted": accepted, "results": results}
+
+
+def _serial_recheck(
+    work_path: str,
+    proposals: Sequence[Dict[str, Any]],
+    config: CoordinatorConfig,
+) -> Dict[str, Any]:
+    if probe._validate_engine(config.recheck_engine) == "tfo":
+        return _serial_recheck_tfo(work_path, proposals, config)
+    return _serial_recheck_global(work_path, proposals, config)
 
 
 def _cec_transaction(
@@ -305,30 +527,41 @@ def run_coordinator(
                 break
 
             snapshot_hash = opt._sha256_file(current_work)
-            candidates, history = _frontier_from_state(opt, current_work, phase_state)
+            candidates, history = _frontier_from_state(
+                opt,
+                current_work,
+                phase_state,
+                history_engine=config.worker_engine,
+            )
             phase_state = None
-            selected_budget = 0
-            eligible: List[Candidate] = []
-            for budget in config.budgets:
-                eligible = [
-                    candidate
-                    for candidate in candidates
-                    if budget > history.get(candidate, 0)
-                ]
-                if eligible:
-                    selected_budget = budget
-                    break
-            if not eligible:
+            schedule = _select_budget_batch(
+                candidates,
+                history,
+                config.budgets,
+                config.batch_size,
+                continue_until_deadline=config.continue_until_deadline,
+                budget_growth=config.budget_growth,
+                max_generated_budget=config.max_generated_budget,
+            )
+            selected_budget = int(schedule["budget"])
+            batch = list(schedule["batch"])
+            if not batch:
                 status = "UNRESOLVED_BUDGETS_EXHAUSTED" if candidates else "COMPLETE"
                 telemetry["unresolved"] = len(candidates)
                 phase_state = (
-                    _phase_state(opt, current_work, candidates, history, status)
+                    _phase_state(
+                        opt,
+                        current_work,
+                        candidates,
+                        history,
+                        status,
+                        history_engine=config.worker_engine,
+                    )
                     if candidates
                     else None
                 )
                 break
 
-            batch = eligible[: max(1, config.batch_size)]
             work_items = [
                 (ordinal, idx, stuck_value)
                 for ordinal, (idx, stuck_value) in enumerate(batch)
@@ -410,6 +643,7 @@ def run_coordinator(
                     candidates,
                     history,
                     "PARALLEL_CLASSIFICATION_CHECKPOINT",
+                    history_engine=config.worker_engine,
                 )
 
             current_gates = opt.parse_aag(current_work)[4]
@@ -439,9 +673,15 @@ def run_coordinator(
             )
             record = {
                 "generation": generation,
+                "worker_engine": config.worker_engine,
+                "recheck_engine": config.recheck_engine,
                 "snapshot_sha256": snapshot_hash,
                 "budget": selected_budget,
                 "batch_size": len(batch),
+                "eligible_at_budget": int(schedule["eligible_count"]),
+                "waiting_for_larger_budget": int(schedule["deferred_count"]),
+                "next_budget": int(schedule["next_budget"]),
+                "generated_budget": bool(schedule["generated_budget"]),
                 "worker_seconds": parallel["seconds"],
                 "worker_counts": worker_counts,
                 "worker_results": parallel["results"],
@@ -533,7 +773,24 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["none", "controls_false", "model", "controls_false_model"],
     )
     parser.add_argument("--order", default="untried_first")
+    parser.add_argument(
+        "--worker-engine",
+        default="global",
+        choices=["global", "tfo"],
+    )
+    parser.add_argument(
+        "--recheck-engine",
+        default="global",
+        choices=["global", "tfo"],
+    )
     parser.add_argument("--recheck-budget", type=int, default=0)
+    parser.add_argument(
+        "--continue-until-deadline",
+        action="store_true",
+        help="grow conflict budgets after the configured ladder until time expires",
+    )
+    parser.add_argument("--budget-growth", type=float, default=2.0)
+    parser.add_argument("--max-generated-budget", type=int, default=0)
     parser.add_argument("--cec-timeout", type=float, default=60)
     parser.add_argument("--report", default="")
     parser.add_argument("--jsonl", default="")
@@ -554,7 +811,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         solver=args.solver,
         phase_mode=args.phase_mode,
         frontier_order=args.order,
+        worker_engine=args.worker_engine,
+        recheck_engine=args.recheck_engine,
         recheck_budget=max(0, args.recheck_budget),
+        continue_until_deadline=args.continue_until_deadline,
+        budget_growth=args.budget_growth,
+        max_generated_budget=max(0, args.max_generated_budget),
         checkpoint_json=args.checkpoint_json,
         audit_assumptions=not args.no_audit,
         cec_timeout=max(0.1, args.cec_timeout),

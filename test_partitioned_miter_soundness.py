@@ -10,6 +10,9 @@ os.environ.setdefault("ALG10_MODE", "fast_save")
 os.environ.setdefault("ALG10_BUDGETS", "100000")
 os.environ.setdefault("ALG10_CONE_BUDGET", "100000")
 os.environ.setdefault("ALG10_CONE_MAX_GATES", "100000")
+os.environ.setdefault("ALG10_CONE_PARTITION_MIN_ROOTS", "1")
+os.environ.setdefault("ALG10_CONE_PARTITION_MAX_GATES", "100000")
+os.environ.setdefault("ALG10_CONE_PARTITION_CONTINUE_AFTER_TIMEOUT", "1")
 
 from partitioned_miter_experiment import (  # noqa: E402
     result_family,
@@ -53,6 +56,96 @@ def normalized_status(status):
     raise AssertionError(f"unexpected unresolved/error status in bounded check: {status}")
 
 
+def check_production_partition(
+    inputs,
+    gates,
+    outputs,
+    idx,
+    stuck_value,
+    expected,
+    partition_sizes,
+):
+    by_lhs, fanout = alg10._fanout_graph(gates)
+    old_size = alg10.CONE_PARTITION_SIZE
+    try:
+        for partition_size in partition_sizes:
+            alg10.CONE_PARTITION_SIZE = partition_size
+            telemetry = alg10._empty_phase_telemetry()
+            timings = {"Encode": 0.0, "SAT": 0.0}
+            result, _primary_values = alg10._partitioned_cone_miter_check(
+                inputs,
+                [],
+                outputs,
+                gates,
+                idx,
+                stuck_value,
+                timings,
+                by_lhs,
+                fanout,
+                telemetry=telemetry,
+            )
+            if result == "SKIP":
+                continue
+            if result == "UNSAT" and not expected:
+                return False, f"production_partition_size_{partition_size}", result
+            if result == "SAT" and expected:
+                return False, f"production_partition_size_{partition_size}", result
+            if result not in {"SAT", "UNSAT"}:
+                return False, f"production_partition_size_{partition_size}", result
+            if telemetry["cone_partition_audit_fail"]:
+                return False, f"production_partition_audit_{partition_size}", result
+    finally:
+        alg10.CONE_PARTITION_SIZE = old_size
+    return True, "", ""
+
+
+def check_production_tfo(inputs, gates, outputs, idx, stuck_value, expected):
+    by_lhs, fanout = alg10._fanout_graph(gates)
+    telemetry = alg10._empty_phase_telemetry()
+    timings = {"Encode": 0.0, "SAT": 0.0}
+    result, _primary_values = alg10._tfo_miter_check(
+        inputs,
+        [],
+        outputs,
+        gates,
+        idx,
+        stuck_value,
+        timings,
+        by_lhs,
+        fanout,
+        telemetry=telemetry,
+    )
+    if result == "SKIP":
+        return True, "", ""
+    if telemetry["cone_tfo_audit_fail"]:
+        return False, "production_tfo_audit", result
+    if result == "UNSAT" and not expected:
+        return False, "production_tfo", result
+    if result == "SAT" and expected:
+        return False, "production_tfo", result
+    if result not in {"SAT", "UNSAT"}:
+        return False, "production_tfo", result
+    return True, "", ""
+
+
+def test_production_partition_audit_rejects_corruption():
+    affected = [8, 10, 12]
+    alg10._audit_cone_root_partitions(affected, [[8], [10], [12]])
+
+    bad_partitions = [
+        [[8], [10]],
+        [[8], [10], [10], [12]],
+        [[8], [], [10], [12]],
+        [],
+    ]
+    for partitions in bad_partitions:
+        try:
+            alg10._audit_cone_root_partitions(affected, partitions)
+        except AssertionError:
+            continue
+        raise AssertionError(f"corrupt partition unexpectedly passed audit: {partitions}")
+
+
 def check_case(inputs, gates, outputs, idx, stuck_value, partition_sizes, budget):
     expected = truth_redundant_multi(inputs, gates, outputs, idx, stuck_value)
     by_lhs, fanout = alg10._fanout_graph(gates)
@@ -77,6 +170,27 @@ def check_case(inputs, gates, outputs, idx, stuck_value, partition_sizes, budget
         partition_status = normalized_status(partition.status)
         if partition_status != mono_status:
             return False, f"partition_size_{partition_size}", partition.status, expected, affected
+    production_ok, production_kind, production_status = check_production_partition(
+        inputs,
+        gates,
+        outputs,
+        idx,
+        stuck_value,
+        expected,
+        partition_sizes,
+    )
+    if not production_ok:
+        return False, production_kind, production_status, expected, affected
+    tfo_ok, tfo_kind, tfo_status = check_production_tfo(
+        inputs,
+        gates,
+        outputs,
+        idx,
+        stuck_value,
+        expected,
+    )
+    if not tfo_ok:
+        return False, tfo_kind, tfo_status, expected, affected
     return True, "", "", expected, affected
 
 
@@ -138,6 +252,7 @@ def main():
     partition_sizes = parse_sizes(args.partition_sizes)
     total = {}
     started = time.time()
+    test_production_partition_audit_rejects_corruption()
     print("Bounded partitioned miter soundness check")
     print(
         f"max_inputs={args.max_inputs} max_gates={args.max_gates} "

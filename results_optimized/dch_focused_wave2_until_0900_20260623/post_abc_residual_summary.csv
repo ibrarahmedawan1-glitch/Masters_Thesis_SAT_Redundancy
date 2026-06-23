@@ -1,0 +1,2 @@
+Flow,Circuits,Starting_Gates,Final_Gates,Residual_Gates_Removed,Candidate_Results,SAT_Reject,UNSAT_Proposed,Timeout,CEC_Pass_Commits,Worker_Errors,Remaining_Obligations,Elapsed_s
+dch,5,77551,56895,20656,286643,267661,42,18940,19,0,17452,21593.837116003036

@@ -166,7 +166,16 @@ def gate_features(gates_raw):
     return depth, fanout
 
 
-def order_candidates(candidates, order, depth, fanout, tried, seed):
+def order_candidates(
+    candidates,
+    order,
+    depth,
+    fanout,
+    tried,
+    seed,
+    gates_raw=None,
+    roots=None,
+):
     items = list(candidates)
     if order == "current":
         return items
@@ -174,6 +183,16 @@ def order_candidates(candidates, order, depth, fanout, tried, seed):
         rng = random.Random(seed + len(items))
         rng.shuffle(items)
         return items
+    if order in {"proof_cost", "proof_cost_untried", "proof_reverse_portfolio"}:
+        if gates_raw is None:
+            raise ValueError(f"{order} requires gates_raw")
+        return alg10._order_global_frontier(
+            items,
+            gates_raw,
+            tried,
+            roots=roots,
+            order=order,
+        )
 
     def key(cand):
         idx, stuck_value = cand
@@ -320,11 +339,20 @@ def run_config(
     tried,
     depth,
     fanout,
+    gates_raw,
+    roots,
     args,
     detail_writer,
 ):
     ordered = order_candidates(
-        candidates, order, depth, fanout, tried, args.random_seed
+        candidates,
+        order,
+        depth,
+        fanout,
+        tried,
+        args.random_seed,
+        gates_raw=gates_raw,
+        roots=roots,
     )
     if args.max_candidates > 0:
         ordered = ordered[: args.max_candidates]
@@ -445,7 +473,13 @@ def main():
         default="all",
     )
     parser.add_argument("--solver", default="cadical153")
-    parser.add_argument("--orders", default="current,tried_asc,depth_desc,depth_asc,fanout_desc,reverse")
+    parser.add_argument(
+        "--orders",
+        default=(
+            "current,tried_asc,depth_desc,depth_asc,fanout_desc,reverse,"
+            "proof_cost,proof_cost_untried,proof_reverse_portfolio"
+        ),
+    )
     parser.add_argument("--budget-kinds", default="conf")
     parser.add_argument("--budget", type=int, default=1000)
     parser.add_argument("--reuse-modes", default="incremental,rebuild:20,fresh")
@@ -522,6 +556,8 @@ def main():
                             tried,
                             depth,
                             fanout,
+                            gates_raw,
+                            roots,
                             args,
                             detail_writer,
                         )

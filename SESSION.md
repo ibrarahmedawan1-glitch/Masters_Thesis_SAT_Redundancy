@@ -1900,3 +1900,871 @@ Checks passed:
   - `sin`, 9 candidates, budget 1000, 2 jobs, exact read-only JSONL/summary
     output generated.
 - `git diff --check`
+
+## 2026-06-14 Exact TFO Decomposition And Candidate Strategy Screen
+
+Goal:
+
+- change the SAT decomposition after the global-miter `sin` and `sqrt` pilots
+  timed out;
+- independently test candidate scheduling without changing the UNSAT-only
+  acceptance boundary;
+- require bounded exhaustive encoding checks and direct ABC CEC before keeping
+  any new engine.
+
+Candidate strategies added as opt-in global frontier orders:
+
+- `proof_cost`: orders by the largest per-observable fanin cone, affected-root
+  count, total per-root cone size, fanout, and depth;
+- `proof_cost_untried`: keeps untried/history priority ahead of the proof-cost
+  score;
+- `proof_reverse_portfolio`: interleaves proof-cost and reverse-topological
+  rankings without dropping or duplicating candidates.
+
+Candidate strategy results:
+
+- `sin`, 9-candidate frontier, CaDiCaL budget 10,000:
+  - current: 9 timeouts, 10.07s;
+  - proof-cost: 9 timeouts, 9.87s;
+  - proof-cost-untried: 9 timeouts, 8.45s.
+- `sqrt`, first 60 proof-cost candidates, budget 2,000:
+  - current: 60 timeouts, 22.22s;
+  - proof-cost: 60 timeouts, 16.29s;
+  - proof-cost-untried: 60 timeouts, 22.05s.
+- `div`, 80 candidates, budget 1,000:
+  - current: 0 SAT rejects, 22.66s;
+  - reverse: 7 SAT rejects, 23.43s;
+  - proof-cost: 1 SAT reject, 19.11s;
+  - proof-reverse portfolio: 1 SAT reject, 20.98s.
+
+Decision:
+
+- proof-cost can reduce runtime but did not improve useful classifications on
+  the tested hard frontiers;
+- reverse-topological remains the stronger `div`/`log2` classification order;
+- keep all new orders opt-in and do not promote one universal default.
+
+Root-partitioned exact cone result:
+
+- production partition encoding was added to the multi-output bounded checker;
+- deliberate omitted, duplicated, and empty root partitions are rejected;
+- 94,044 multi-output candidate checks passed;
+- `sin`: all sampled candidates affected all 25 roots, and each root cone still
+  contained about 5,283 of 5,375 gates; partitioning multiplied timeout work;
+- `sqrt`: per-root cones still contained the full 24,564-gate good cone;
+- decision: exact root partitioning is sound but is a no-go for the current
+  arithmetic frontiers.
+
+Exact TFO-slice engine:
+
+- added opt-in `ALG10_CONE_ENGINE=tfo` and `hybrid_tfo`;
+- encodes the complete good affected-output cone once;
+- duplicates only the target and gates in its relevant transitive fanout to
+  affected real outputs/latch-next roots;
+- side inputs outside the faulty TFO reuse exact good-circuit values;
+- `_audit_tfo_slice(...)` recomputes the expected slice and rejects a missing
+  target, missing/extra relevant gate, or affected root outside the slice;
+- SAT remains rejection-only, UNSAT is the only acceptance, and final ABC CEC
+  remains mandatory.
+
+TFO validation:
+
+- `test_alg10_tfo_miter.py`: closure-corruption test plus full `c432` pipeline
+  CEC PASS;
+- `test_encoding_soundness_bounded.py --include-depth3`: PASS on 536,376
+  candidates, including global, TFI, cone, grouped cone, TFO cone, window, and
+  rewrite semantics;
+- `test_partitioned_miter_soundness.py`: PASS on 94,044 multi-output candidates
+  with both production partition and TFO encodings;
+- Alg10 checkpoint, resume, grouped-cone, hybrid safety, parallel shard,
+  transactional coordinator, and algorithms 1-10 regressions passed;
+- `git diff --check` passed.
+
+Hard-frontier TFO evidence:
+
+- `sin`, all 9 corrected frontier candidates, budget 10,000:
+  - monolithic exact cone: 9 timeouts;
+  - exact TFO: 1 UNSAT acceptance, 8 timeouts;
+  - aggregate clauses: 291,366 -> 180,870;
+  - aggregate time: 8.17s -> 4.45s;
+  - accepted candidate: gate index `3645`, SA0;
+  - unlimited CaDiCaL recheck returned UNSAT;
+  - rewrite reduced the checkpoint work AAG `5375 -> 5371`;
+  - ABC CEC PASS against both the checkpoint work AAG and normalized source.
+- durable result:
+  `results_optimized/tfo_miter_sin_frontier_20260614/`
+- `sqrt`, first 60 portfolio candidates, budget 2,000:
+  - monolithic exact cone: 60 timeouts;
+  - exact TFO: 3 SAT rejects, 57 timeouts;
+  - clauses: 8,845,285 -> 5,259,796;
+  - time: 49.36s -> 41.11s;
+  - no new UNSAT acceptance in this sample.
+
+Decision:
+
+- exact TFO slicing is the recommended next focused SAT decomposition;
+- do not launch a blind 12-hour campaign yet;
+- next run should transactionally apply the verified `sin` acceptance in a
+  separate checkpoint family, regenerate the frontier, then run TFO on the new
+  generation;
+- screen the remaining `sqrt`, `div`, and `hyp` frontiers with TFO before
+  deciding whether a multi-hour campaign is justified.
+
+## 2026-06-14 Parallel Exact TFO Workers And Transactional Commit
+
+Implementation:
+
+- extended `alg10_frontier_shard_probe.py` with `--engine tfo`;
+- each worker process builds an independent exact candidate-local TFO CNF on
+  one immutable work AAG;
+- every TFO slice is closure-audited before SAT and reports affected roots,
+  good-cone gates, faulty-TFO gates, and clause count;
+- serial and parallel result comparison remains candidate/status exact;
+- extended `alg10_parallel_commit_coordinator.py` with
+  `--worker-engine tfo` and `--recheck-engine tfo`;
+- the coordinator rechecks proposed UNSAT candidates sequentially against a
+  progressively updated private generation, then requires full ABC CEC before
+  commit;
+- checkpoint budget history now carries `history_engine`, preventing an old
+  global-miter timeout from suppressing a new TFO query;
+- defaults remain `global`, so existing campaigns do not change behavior.
+
+Parallel measurements on identical frozen frontiers:
+
+- `sin`, all 9 candidates, CaDiCaL budget 10,000, 4 workers:
+  - serial TFO: 4.435s;
+  - parallel TFO: 2.141s;
+  - speedup: 2.07x;
+  - exact status match: 1 UNSAT proposal, 8 timeouts.
+- `sqrt`, first 60 current-order candidates, budget 2,000, 4 workers:
+  - serial TFO: 64.110s;
+  - parallel TFO: 33.178s;
+  - speedup: 1.93x;
+  - exact status match: 60 timeouts.
+- durable reports:
+  - `results_optimized/tfo_parallel_probe_sin_20260614.json`
+  - `results_optimized/tfo_parallel_probe_sqrt60_20260614.json`
+
+Ordering correction:
+
+- the probe command requested `proof_cost_reverse`, which is not a supported
+  frontier order and therefore normalized to `current`;
+- this does not affect the serial/parallel speedup result because both paths
+  used the identical frozen candidate list;
+- future pilots use the valid, tested `proof_reverse_portfolio` order.
+
+Transactional `sin` commit:
+
+- source: normalized finishline `sin` seed;
+- checkpoint work generation: 5,375 gates;
+- four TFO workers proposed gate index `3645`, SA0;
+- unlimited sequential TFO recheck: UNSAT in 0.092s;
+- committed work generation: `5375 -> 5371`;
+- commit CEC: PASS;
+- final output CEC: PASS;
+- no failed commits;
+- durable output and checkpoint family:
+  - `results_optimized/parallel_tfo_sin_20260614/`
+  - `results_optimized/alg10_checkpoints_parallel_tfo_sin_20260614/`
+
+Validation after parallel integration:
+
+- focused TFO serial/parallel/full-global identity tests passed;
+- focused TFO coordinator recheck and CEC transaction test passed;
+- bounded encoding soundness PASS on 632,136 candidates;
+- partitioned/multi-output soundness PASS on 121,764 candidates;
+- TFO pipeline, hybrid safety, checkpoint/resume, parallel portfolio, and
+  proof-cost strategy tests passed;
+- algorithms 1-10 regression passed, including CEC on `c17` and `c432`;
+- `git diff --check` passed.
+
+Decision:
+
+- parallel exact TFO is worth keeping: both hard samples were exact and nearly
+  halved wall-clock time;
+- transactional TFO integration is implemented and validated;
+- use the new TFO checkpoint family for further `sin` generations and keep
+  global mode as the unchanged default until broader campaign evidence exists.
+
+Four-hour pre-overnight pilot:
+
+- runner: `run_alg10_parallel_tfo_sin_4h.sh`;
+- starts from the CEC-passed 5,371-gate TFO checkpoint;
+- four worker processes;
+- valid `proof_reverse_portfolio` ordering;
+- escalating conflict budgets: `10k,50k,250k,1M,5M`;
+- batch size 16 and nominal hard campaign budget 14,400 seconds;
+- early-tier timeouts remain in the checkpoint and advance to larger budgets;
+- UNSAT proposals receive unlimited sequential TFO rechecks before CEC.
+
+Pilot launch:
+
+- service:
+  `alg10-parallel-tfo-sin-4h-20260614-202340.service`;
+- started `2026-06-14 20:23:59 CEST`;
+- output:
+  `results_optimized/parallel_tfo_sin_4h_20260614_202340/`;
+- checkpoints:
+  `results_optimized/alg10_checkpoints_parallel_tfo_sin_4h_20260614_202340/`;
+- initial live check after about 25 seconds:
+  - 82 checkpointed generations;
+  - 1,312 SAT rejects;
+  - 0 timeouts;
+  - 0 UNSAT proposals or commits yet;
+  - still processing the 10,000-conflict tier.
+- no automatic overnight handoff is enabled; inspect the completed four-hour
+  summary before making the overnight decision.
+
+Cyclic timeout queue policy:
+
+- each budget is a complete frontier pass, not a terminal attempt;
+- SAT candidates are permanently rejected from the current generation;
+- timeout candidates remain in the frontier with their last tried budget;
+- while untried candidates remain, they complete the current low-budget pass;
+- after that pass, the timeout waiting list becomes eligible at the next budget
+  (`10k -> 50k -> 250k -> 1M -> 5M`);
+- a focused scheduler regression proves that a timeout is deferred, selected at
+  the next larger budget, and only marked exhausted after the final tier;
+- generation records now report `eligible_at_budget`,
+  `waiting_for_larger_budget`, and `next_budget`.
+
+Four-hour pilot completed result:
+
+- completed normally on `2026-06-14 21:35:47 CEST`; the service disappeared
+  after successful completion;
+- actual runtime: 4,307.90s (about 71.8 minutes), because the complete frontier
+  exhausted the configured ladder before the four-hour wall-clock limit;
+- 1,486 checkpointed generations;
+- budget waves:
+  - 10,000: 1,344;
+  - 50,000: 105;
+  - 250,000: 32;
+  - 1,000,000: 4;
+  - 5,000,000: 1;
+- worker classifications:
+  - 21,473 SAT rejects;
+  - 2,235 intermediate timeouts requeued across larger budgets;
+  - 1 UNSAT proposal;
+- accepted gate index `483`, SA0 at the 1,000,000-conflict tier;
+- unlimited sequential TFO recheck confirmed UNSAT;
+- commit reduced the post-TFO work AAG `5371 -> 5369`;
+- commit CEC PASS and final independent equivalence PASS;
+- zero failed CEC commits;
+- final corrected source reduction is `5416 -> 5369`, or 47 AND gates;
+- only three candidates remain, each exhausted through 5,000,000 conflicts:
+  - gate `1601`, SA1;
+  - gate `1600`, SA0;
+  - gate `470`, SA0;
+- status: `UNRESOLVED_BUDGETS_EXHAUSTED`;
+- durable summary:
+  `results_optimized/parallel_tfo_sin_4h_20260614_202340/summary.json`.
+
+## 2026-06-14 Six-Hour Parallel TFO Benchmark Campaign
+
+Requirement:
+
+- run the best current benchmark checkpoints for six hours;
+- do not stop merely because the configured conflict ladder is exhausted;
+- keep timeout candidates in a waiting frontier and increase their budget on
+  every later cycle;
+- preserve parallel immutable workers, sequential UNSAT recheck, checkpoint
+  resume, and full CEC commit gating.
+
+Implementation:
+
+- coordinator option `--continue-until-deadline` now synthesizes larger budgets
+  after the fixed ladder;
+- default generated growth is 2x, so the campaign continues
+  `5M -> 10M -> 20M -> 40M -> ...`;
+- generated budget and next-budget telemetry are stored in every generation;
+- added focused scheduler tests for generated growth and optional caps;
+- added `alg10_parallel_tfo_benchmark_campaign.py`;
+- added `run_alg10_parallel_tfo_benchmarks_6h.sh`;
+- the campaign gives each target a ten-minute slice and resumes its own newest
+  checkpoint on later rounds, preventing one hard circuit from monopolizing
+  the full six hours.
+
+Selected best corrected checkpoints:
+
+1. `sin`: unresolved 3, removed 47, global frontier.
+2. `sqrt`: unresolved 368, removed 54, global frontier.
+3. `hyp`: unresolved 938, removed 4, global frontier.
+4. `div`: unresolved 955, removed 233, global frontier.
+5. `log2`: unresolved 10,295, exact cone frontier.
+6. `mem_ctrl`: unresolved 52,546, TFI frontier.
+
+Launch:
+
+- service:
+  `alg10-parallel-tfo-benchmarks-6h-20260614-215326.service`;
+- started `2026-06-14 21:53:45 CEST`;
+- nominal deadline: `2026-06-15 03:53:45 CEST`;
+- controller plus four worker processes confirmed active;
+- fixed ladder: `10k,50k,250k,1M,5M`;
+- generated ladder: unbounded 2x growth until the shared deadline;
+- output root:
+  `results_optimized/parallel_tfo_benchmarks_6h_20260614_215326/`;
+- the live log confirmed all six intended seed checkpoints before solving;
+- no automatic overnight continuation is attached.
+
+## 2026-06-15 Smart Resume and Hardware-Aware Parallelism
+
+The next campaign launch now makes its restart decision from durable state
+rather than treating every invocation as a cold run:
+
+- checkpoint discovery includes top-level `alg10_checkpoints*` families and
+  nested `parallel_tfo_*/**/checkpoints` directories from earlier campaigns;
+- prior visit outputs with `final_verify=PASS` are eligible as restart seeds,
+  covering commits that finished at a time-slice boundary before a new exact
+  frontier was serialized; the output receives a fresh ABC CEC before
+  materialization as a new seed;
+- for the same circuit, the valid checkpoint with the lowest current AND-gate
+  count wins first, then lower unresolved count and newer timestamp;
+- the committing coordinator uses `checkpoint_select="gates"` so a newly
+  reduced, CEC-passed AAG cannot be replaced by an older higher-gate checkpoint
+  merely because the older frontier is smaller;
+- unchanged work resumes the exact candidate list and engine-specific maximum
+  conflict budget tried for every survivor;
+- after an accepted rewrite, the lower-gate work AAG is retained but its
+  frontier is regenerated because gate indices and cones may have changed.
+
+The campaign records `last_abort_reason` and `next_action` per target. Current
+policy is:
+
+- timeout -> preserve candidate and increase budget;
+- SAT reject -> continue the remaining frontier;
+- CEC-passed commit -> regenerate frontier on the committed circuit;
+- CEC failure or exception -> stop that target for audit;
+- plain time-slice expiry -> resume the exact saved frontier on the next visit.
+
+Hardware inspection inside the current environment reports Ryzen 5 5600X,
+6 physical cores, 12 logical CPUs, and about 15 GiB visible RAM. The host may
+have 32 GiB installed, but only the memory visible to this environment can be
+scheduled safely. `--jobs 0` therefore selects 6 TFO workers automatically.
+Eight workers remains a reasonable measured SMT experiment; 24-29 workers is
+rejected because it oversubscribes the 12 visible logical CPUs and is expected
+to reduce SAT throughput through CPU contention.
+
+The workers cooperate through a single-writer coordinator: shared queue,
+candidate ownership, timeout history, classifications, sequential proposal
+recheck, checkpointing, and CEC-gated commits. They do not exchange learned
+clauses. Each candidate-local TFO instance has a different CNF, so cross-worker
+clause sharing requires a separate proof-preserving design and is not claimed.
+
+Thesis framing: a resource-aware, checkpointed SAT portfolio scheduler for
+exact candidate-local TFO proofs, with adaptive conflict budgets and
+transactional CEC-verified commits. This is stronger and more accurate than
+describing the current implementation as distributed cooperative SAT.
+
+Focused verification:
+
+- `venv/bin/python test_alg10_parallel_tfo_benchmark_campaign.py`: pass;
+- worker auto-sizing selects 6 on a 6C/12T, 32 GiB model;
+- an explicit 24-worker request is rejected;
+- checkpoint ranking regression confirms lower gate count outranks a smaller
+  unresolved frontier;
+- verified campaign-output regression confirms a CEC-passed output can seed a
+  regenerated frontier;
+- abort-reason policy regression covers complete, CEC failure, commit,
+  timeout, and SAT-reject outcomes.
+
+## 2026-06-15 Dynamic Cross-Circuit TFO Worker Pool
+
+The previous campaign assigned all workers to one circuit visit. This left
+capacity underused when a circuit had fewer candidates than workers, most
+visibly `sin` with only three surviving candidates, and allowed one long wave
+to delay every other benchmark.
+
+Implemented `alg10_dynamic_tfo_pool_campaign.py`:
+
+- one hardware-sized process pool is shared by every benchmark circuit;
+- workers pull candidate microbatches from a global queue whenever they finish;
+- scheduling balances the number of active tasks per circuit;
+- untried candidates are preferred before timeout retries within a circuit;
+- a timeout remains in the exact frontier and returns at the next configured or
+  generated conflict budget;
+- small frontiers use one candidate per task so separate workers can solve the
+  final survivors concurrently;
+- broad frontiers use configurable microbatches, default 16, to amortize AAG
+  parsing and CNF construction overhead;
+- every task carries circuit generation and work-AAG SHA metadata;
+- stale results are rejected rather than applied to a rewritten circuit.
+
+Commit safety:
+
+- an UNSAT proposal stops new dispatches only for its circuit;
+- already-running tasks on that immutable generation are allowed to finish;
+- sequential TFO recheck and ABC CEC run in a separate proposal-barrier process;
+- proposal barriers count against the same global worker limit, preventing CPU
+  oversubscription;
+- unrelated circuits continue receiving free worker slots during recheck/CEC;
+- a CEC-passed commit regenerates that circuit's frontier and invalidates its
+  old candidate indices;
+- classification progress is checkpointed periodically and every commit is
+  checkpointed immediately.
+
+Reason-aware queue behavior:
+
+- `UNTRIED` -> use the first conflict budget;
+- `SAT_REJECT` -> remove the candidate and continue;
+- `SAT_TIMEOUT` -> retain the candidate and increase its budget;
+- `UNSAT_PROPOSAL` -> enter the per-circuit serial proof barrier;
+- `CEC_PASSED_COMMIT` -> keep the lower-gate AAG and regenerate;
+- CEC or worker failure -> stop only that circuit for audit.
+
+The six-hour launcher now invokes the dynamic pool with `--jobs 0`, which
+selects six workers on the visible Ryzen 5 5600X hardware. The already-running
+2026-06-14 campaign was not restarted and continues using its original
+four-worker per-circuit process.
+
+Utilization telemetry in `summary.json` includes:
+
+- classification tasks submitted/completed;
+- proposal barriers submitted/completed;
+- classification and barrier busy seconds;
+- maximum simultaneously active worker slots;
+- dispatch counts by `UNTRIED` and `TIMEOUT_RETRY`;
+- measured worker utilization against total worker capacity.
+
+Verification:
+
+- `venv/bin/python test_alg10_dynamic_tfo_pool_campaign.py`: pass;
+- two circuits shared one two-worker executor;
+- both circuits produced CEC-passed commits and final equivalent outputs;
+- asynchronous proposal barriers completed inside the same two-slot budget;
+- zero stale results and zero worker errors;
+- existing parallel coordinator, smart campaign, and exact TFO miter tests pass;
+- launcher shell syntax, Python compilation, and `git diff --check` pass.
+
+## 2026-06-15 Exact Encoding Order And Persistent-Budget Experiment
+
+Implemented `hard_candidate_strategy_experiment.py` as a read-only controlled
+experiment over one frozen checkpoint frontier.
+
+Compared exact methods:
+
+- `tfo`: complete affected-root good cone plus one audited faulty TFO slice;
+- `partition_tfo`: exact affected-root groups, each with its own audited TFO
+  slice;
+- `cone`: complete monolithic affected-root fault cone;
+- optional `partition_cone` control.
+
+For each method the runner compares:
+
+- `fresh`: rebuild the SAT solver at each increasing conflict tier;
+- `persistent`: retain one solver and learned clauses, granting only the
+  remaining conflicts needed to reach each cumulative target.
+
+Every method is measured once per candidate and mode. All requested process
+orders are replayed from those measurements with stop-on-first-SAT/UNSAT
+semantics. This removes duplicated experimental work and makes every order use
+the same candidate, budget, solver, and measured method cost. Resolved exact
+encodings must agree; any SAT/UNSAT mismatch raises immediately.
+
+Preliminary `sin` pilot:
+
+- frozen 5,369-gate checkpoint, candidate gate 1601 SA1, 25 affected roots;
+- budgets `100,1000`; every method timed out, so no order resolved the
+  candidate at this deliberately small screen;
+- persistent TFO: 23,869 clauses, 0.077s, 1,000 conflicts, one solver;
+- fresh TFO: 23,869 clauses, 0.097s, 1,100 conflicts, two solvers;
+- persistent cone: 32,338 clauses, 0.090s;
+- persistent one-root `partition_tfo`: 520,058 aggregate clauses, 1.819s.
+
+One-candidate cross-circuit screen at the same `100,1000` ladder:
+
+- `sqrt`: one affected root; persistent TFO 0.167s versus cone 0.302s;
+- `hyp`: one affected root; persistent TFO 1.570s versus cone 2.157s;
+- `log2`: one affected root; persistent TFO 0.333s versus cone 0.734s;
+- `div`: two affected roots; persistent TFO found SAT in 0.105s,
+  partitioned TFO found the same SAT in 0.131s, and cone timed out in 0.361s;
+- `mem_ctrl`: one affected root; every encoding found SAT in under 1ms.
+
+Interpretation:
+
+- clause retention showed the expected reduction in solver instances,
+  repeated conflicts, and time on this sample;
+- one-root output decomposition repeated large overlapping good cones and was
+  about 24 times slower than persistent TFO here;
+- on one-root candidates, `partition_tfo` is semantically the same method as
+  TFO and should not be run as a separate production stage;
+- the preliminary best order is persistent TFO first and full cone last;
+- partitioned TFO should be tested only after a TFO timeout, with multiple
+  affected roots and a clause-size eligibility limit to prevent `sin`-style
+  overlap blowups;
+- this is evidence against placing decomposition first for every arithmetic
+  candidate, not evidence against decomposition on structurally suitable
+  candidates;
+- the next controlled run should sample all hard circuits and rank orders by
+  resolved count first, then runtime and conflict cost.
+
+Artifacts:
+
+- `results_optimized/hard_candidate_strategy_sin_pilot_20260615/`
+- `results_optimized/hard_candidate_strategy_screen_20260615/`
+- `test_hard_candidate_strategy_experiment.py`
+
+Verification:
+
+- focused strategy tests passed;
+- exact SAT and redundant-fault agreement passed for TFO, partitioned TFO,
+  cone, and partitioned cone in both fresh and persistent modes;
+- bounded multi-output partition checker passed 15,704 candidate cases;
+- exact production TFO tests passed;
+- CLI smoke tested all six process orders;
+- Python compilation and `git diff --check` passed.
+
+## 2026-06-15 Completed Six-Hour Cyclic TFO Campaign And Dynamic Relaunch
+
+The older four-worker round-robin campaign completed at `2026-06-15 10:09
+CEST`. Its nominal six-hour deadline was exceeded because in-flight exact SAT
+calls and unlimited sequential rechecks were drained to completion.
+
+Completed campaign:
+
+- output: `results_optimized/parallel_tfo_benchmarks_6h_20260614_215326/`;
+- final status: `TIME_BUDGET_COMPLETE`;
+- wall time: 44,130.52s, or about 12h 15m;
+- 10 CEC-passed commits and zero CEC failures;
+- 35 additional verified AND-gate removals;
+- cumulative removals across the six selected circuits: 791.
+
+New removals by circuit:
+
+- `sin`: +6, final 5,363 gates;
+- `div`: +17, final 56,997 gates;
+- `log2`: +6, final 31,638 gates;
+- `mem_ctrl`: +6, final 46,828 gates;
+- `sqrt`: no new removal in this campaign;
+- `hyp`: no new removal in this campaign.
+
+The decisive `sin` result validates cyclic escalation:
+
+- the same three candidates timed out at 10M and 20M conflicts;
+- all three returned exact UNSAT proposals at 40M;
+- parallel worker solve times were about 2.93h, 3.01h, and 3.26h;
+- sequential exact TFO rechecks accepted all three;
+- one candidate became structurally unobservable after an earlier accepted
+  rewrite;
+- the combined rewrite reduced `sin` from 5,369 to 5,363 gates;
+- final ABC CEC passed.
+
+Interpretation:
+
+- cyclic escalation is justified because the 40M tier resolved candidates that
+  remained unresolved through 20M;
+- low-budget TFO remains the high-throughput path for `div`, `log2`, and
+  `mem_ctrl`;
+- `sqrt` and `hyp` should not monopolize workers after weak low-budget yield;
+- the old scheduler wasted capacity while three long `sin` calls occupied only
+  three of four workers and blocked visits to other circuits;
+- unlimited sequential recheck was expensive but produced a real verified
+  reduction, so future work should preserve proof completion while running
+  unrelated classifications concurrently.
+
+Started the latest safe production campaign:
+
+- service: `alg10-dynamic-tfo-benchmarks-6h-20260615-103558.service`;
+- started: `2026-06-15 10:36:12 CEST`;
+- nominal deadline: `2026-06-15 16:36:12 CEST`;
+- output:
+  `results_optimized/parallel_tfo_benchmarks_dynamic_tfo_6h_20260615_103558/`;
+- scheduler: one dynamic cross-circuit pool with six physical-core workers;
+- cyclic ladder: `10k,50k,250k,1M,5M`, then unbounded 2x generated budgets;
+- exact TFO workers, sequential exact TFO proposal barriers, and CEC-gated
+  commits;
+- candidate order: `proof_reverse_portfolio`.
+
+Selected starting gate counts:
+
+- `sin`: 5,363;
+- `sqrt`: 24,562;
+- `hyp`: 214,331;
+- `div`: 56,997;
+- `log2`: 31,638;
+- `mem_ctrl`: 46,828.
+
+Initial telemetry confirmed six mixed-circuit dispatches at 10,000 conflicts
+and six active worker slots. Persistent learned-clause TFO remains an
+experiment-only implementation and is not claimed as part of this production
+campaign.
+
+## 2026-06-15 Consolidated External Review Audit
+
+Four skeptical LLM reviews were checked against the implementation instead of
+being accepted at face value. The alleged complemented-literal, checkpoint
+generation-mixing, frontier-overlap, and sequential multi-commit bugs were not
+present:
+
+- fanout construction normalizes both literal polarities with `& ~1`;
+- verified-output seeds regenerate a full frontier with no old history;
+- exact resume rejects duplicate or overlapping frontier candidates;
+- proposal rechecks update `working_gates` before checking the next proposal,
+  and the final batch is CEC checked against the source.
+
+The TFO audit did share its forward traversal with slice construction. It was
+strengthened with an independent fanin-dependency derivation that rejects any
+missing target-dependent gate. New tests cover complemented-only fanout,
+independent boundary side-input reuse, reconvergent target-dependent side
+inputs, latch cuts, full-cone agreement, and end-to-end CEC.
+
+Focused validation passed:
+
+- exact TFO test suite;
+- checkpoint pending/escalated and duplicate invariants;
+- verified-output seed regeneration;
+- cyclic timeout scheduling;
+- sequential TFO recheck plus CEC;
+- bounded exhaustive semantics over 9,468 small circuits and 37,416 candidate
+  obligations.
+
+The confirmed weaknesses are methodological and performance related:
+
+- nominal campaign deadlines can overrun while SAT and rechecks drain;
+- conflict budgets are not directly comparable across different CNF sizes;
+- microbatch head-of-line blocking needs measurement;
+- persistent TFO is still experiment-only;
+- ABC baselines, repetitions, worker-count ablations, and scheduler controls
+  are still required.
+
+The consolidated verdict and experiment plan are in
+`LLM_FEEDBACK_CONSOLIDATED_ACTION_PLAN_2026-06-15.md`.
+
+## 2026-06-15 Dynamic Campaign Live-Edit Incident
+
+The dynamic campaign
+`alg10-dynamic-tfo-benchmarks-6h-20260615-103558.service` stopped at
+approximately 11:00 CEST with `FINISHED_WITH_FAILURES`.
+
+Root cause:
+
+- while the campaign was active, `_audit_tfo_slice(...)` was changed to add a
+  required `gates_raw` argument;
+- existing process-pool workers still held the old
+  `alg10_frontier_shard_probe._solve_items(...)` caller;
+- `_load_alg10(...)` reloaded the newly edited optimizer inside those old
+  workers;
+- the mixed old caller/new callee raised
+  `TypeError: _audit_tfo_slice() missing 1 required positional argument:
+  'gates_raw'`.
+
+This was a live source compatibility error caused by the review-time edit. It
+was not an out-of-memory failure:
+
+- systemd reported a 1.0 GB memory peak and zero swap usage;
+- no kernel OOM event was present;
+- current available memory remained about 12 GB.
+
+Recovery validation:
+
+- all six final output AAGs passed a fresh ABC CEC against their source;
+- all six final checkpoint frontiers matched their work-AAG SHA;
+- the clean two-circuit dynamic-pool test passed with zero worker errors;
+- the TFO test suite and Python compilation passed.
+
+Recovered current gates:
+
+- `hyp`: 214,331;
+- `sqrt`: 24,562;
+- `sin`: 5,363;
+- `log2`: 31,638;
+- `mem_ctrl`: 46,816;
+- `div`: 56,993.
+
+The recovered selector uses these exact checkpoints. The audit API was made
+backward-compatible by making `gates_raw` optional, while every current caller
+passes it and receives the stronger independent dependency audit.
+
+Operational rule: do not modify or reload campaign source modules while a
+long-running production campaign is active. Freeze the code before launch, or
+stop and checkpoint the campaign before changing worker/coordinator APIs.
+
+A clean recovery service launch was prepared but not started because the
+required systemd approval was declined.
+
+## 2026-06-15 Feedback Validation And Production Freeze
+
+The external-review concerns were tested before another long campaign. Full
+results are in `FEEDBACK_VALIDATION_RESULTS_2026-06-15.md`.
+
+Correctness validation:
+
+- depth-3 bounded production TFO validation passed 632,136 candidate
+  obligations over 116,748 circuits;
+- bounded multi-output validation passed 2,390,128 candidate obligations over
+  401,096 output sets;
+- exact TFO, full-cone agreement, resume, coordinator, source-change, and CEC
+  regression suites passed.
+
+Controlled evidence:
+
+- persistent TFO was 33.9% faster than fresh retries on five fixed `hyp`
+  survivors and 53.0% faster on five fixed `sin` survivors;
+- one dynamic-versus-round-robin treatment measured 7.570 versus 3.468
+  candidate results per second after actual drain time;
+- eight workers beat six by about 13% on the fixed `sin` sample and 6.5% on
+  `hyp`;
+- broad batch 16 retained the best low-budget throughput, while production
+  timeout retries were changed to singleton tasks;
+- partitioned TFO was only about 4% faster on five selected `div` cases and
+  remains experiment-only;
+- ABC `dc2` removed 32,484 gates and `fraig` removed 28,265 gates from the same
+  six recovered outputs, with all baseline CEC checks passing.
+
+Production hardening:
+
+- worker processes cache one optimizer generation instead of reloading source
+  on every task;
+- source hashes stop dispatch and preserve a verified checkpoint after a live
+  source change;
+- untried microbatches remain 16 and timeout retries use microbatch 1;
+- generated budgets and proposal rechecks are capped at 40M conflicts;
+- deadline admission scales observed candidate time to the requested budget;
+- unknown-duration tasks are blocked in the final 900 seconds;
+- 300 seconds are reserved for checkpointing and final CEC;
+- proposal barriers that cannot fit are deferred and remain unresolved;
+- the next performance launcher uses eight workers.
+
+Real-checkpoint smoke results:
+
+- the pre-admission 60-second smoke completed 79 tasks and 1,248 candidate
+  results with zero worker errors, zero stale results, and six final CEC
+  passes, but took 295.646 seconds after draining;
+- the deadline-admission smoke requested five seconds, completed in 5.689
+  seconds, saved the frontier, and passed final CEC with zero errors.
+
+No six-hour or eight-hour campaign was launched. The frozen next-run policy is
+dynamic eight-worker exact TFO, batch 16 for untried work, singleton retries,
+the `10k,50k,250k,1M,5M,10M,20M,40M` ladder, deadline admission, sequential
+exact recheck, and transactional ABC CEC. Persistent solving and decomposition
+remain experimental.
+
+## 2026-06-15 ABC/SAT Ordering And Residual Redundancy Study
+
+The earlier ABC baseline was identified as `SAT -> ABC`, because its inputs
+were recovered SAT outputs. Direct-original ABC controls and post-ABC exact
+TFO screens were added.
+
+Direct-original ABC:
+
+- `fraig` passed CEC on all six sources;
+- `dc2` and `dc2_fraig` passed on five sources;
+- their `hyp` outputs were smaller but direct CEC timed out at 300 seconds and
+  are not counted as verified.
+
+`SAT -> dc2_fraig` passed CEC on all six recovered outputs and produced
+327,148 aggregate gates.
+
+Five directly comparable circuits:
+
+- `original -> dc2_fraig`: 115,768 gates;
+- `original -> dc2_fraig -> 60s TFO`: 115,764;
+- `SAT -> dc2_fraig`: 115,537;
+- `SAT -> dc2_fraig -> 60s TFO`: unchanged.
+
+SAT preprocessing improved the aggregate by 227 gates. It helped `sin` by 27,
+`sqrt` by 10, `log2` by 165, and `mem_ctrl` by 52, but hurt `div` by 27.
+
+Post-ABC residual exact-TFO screens:
+
+- original `dc2` outputs: three UNSAT proposals, two CEC-passed commits, six
+  gates removed;
+- original `fraig` outputs: no UNSAT proposal;
+- original `dc2_fraig` outputs: two UNSAT proposals, two CEC-passed commits,
+  four gates removed;
+- `SAT -> dc2_fraig` outputs: no proposal in 265 sampled obligations.
+
+The residual removals were in `sin` and `log2`. This establishes that ABC can
+expose sparse exact constant redundancies and that ordering matters. It does
+not establish that post-ABC SAT is generally cost-effective or that a
+time-limited zero result means no redundancy exists.
+
+New artifacts:
+
+- `post_abc_residual_tfo_experiment.py`;
+- `ABC_SAT_ORDERING_COMPARISON_2026-06-15.csv`;
+- `LLM_FEEDBACK_DEFENSE_AND_STRATEGY_2026-06-15.md`;
+- `LLM_REVIEW_PROMPT_POST_VALIDATION_ABC_ORDERING_2026-06-15.md`.
+
+## 2026-06-15 Native Exact-TFO Seven-Hour Campaign
+
+The four post-validation external assessments agreed that the implementation
+is thesis-worthy with honest framing. Their remaining requests are mainly
+repetitions, hard-tail variance, crash injection, candidate ordering, and
+persistent retry affinity. These changes were not rushed into the production
+run because they are not yet validated in the shared scheduler.
+
+ABC ordering remains an experiment-only thesis baseline. The production
+campaign does not use `dc2`, `fraig`, or any ABC preprocessing/resynthesis.
+ABC is used only as the final CEC verifier at the existing transactional
+commit boundary.
+
+A pinned native launcher was added:
+
+- `alg10_native_tfo_7h_campaign.py`;
+- `run_alg10_native_tfo_benchmarks_7h.sh`.
+
+The launcher rejects paths containing `abc_baseline` or `post_abc`, records
+`abc_preprocessing: false`, and pins all six exact native checkpoint paths.
+This prevents the automatic lower-gate selector from ever selecting an
+experimentally ABC-derived AAG.
+
+Prelaunch validation:
+
+- all six native seed work AAGs passed fresh ABC CEC against their original
+  source;
+- 30-second native dispatch smoke completed 40 tasks;
+- zero worker errors, stale results, proposals, or CEC failures;
+- the smoke rejected 619 candidate obligations and produced newer exact
+  frontiers;
+- those newer smoke checkpoints became the pinned seven-hour seeds;
+- Python compilation, shell syntax, and `git diff --check` passed;
+- about 12 GiB memory was available with zero swap use.
+
+Started service:
+
+- unit: `alg10-native-tfo-7h-20260615-124953.service`;
+- invocation ID: `9f87d8c3c4244d21b889ba93231331b3`;
+- started: `2026-06-15 12:50:07 CEST`;
+- nominal deadline: `2026-06-15 19:50:07 CEST`;
+- output:
+  `results_optimized/parallel_tfo_native_tfo_7h_20260615_124953/`;
+- mode: native exact TFO only;
+- workers: 8;
+- initial aggregate gates: 379,703;
+- initial exact unresolved obligations: 269,969;
+- budgets: `10k,50k,250k,1M,5M,10M,20M,40M`;
+- untried microbatch: 16;
+- retry microbatch: 1;
+- unknown-duration admission guard: final 900 seconds;
+- checkpoint/final-CEC reserve: 300 seconds.
+
+At `2026-06-15 12:52:49 CEST`:
+
+- service status was active/running;
+- all eight worker slots had been active;
+- 192 tasks had been dispatched;
+- measured utilization was 58.6%;
+- current memory was about 1.75 GiB;
+- zero launch or worker errors were reported;
+- `mem_ctrl` had one native CEC-passed commit, reducing 46,816 to 46,808
+  gates;
+- its exact frontier regenerated to 93,168 current obligations after the
+  generation change.
+
+Monitoring:
+
+```bash
+venv/bin/python monitor_alg10_campaign.py \
+  results_optimized/parallel_tfo_native_tfo_7h_20260615_124953
+```
+
+```bash
+journalctl --user -fu alg10-native-tfo-7h-20260615-124953.service
+```
+
+Do not edit `optimizer_alg10_tiered.py`,
+`alg10_frontier_shard_probe.py`,
+`alg10_parallel_commit_coordinator.py`, or
+`alg10_dynamic_tfo_pool_campaign.py` while this service is active. The source
+manifest will stop dispatch and checkpoint if any of them changes.

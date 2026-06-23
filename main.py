@@ -1,10 +1,13 @@
 import os
 import csv
+import json
 import shutil
 import glob          
 import random
 import time
 import importlib
+import subprocess
+import sys
 from datetime import datetime
 from aag_metrics import compute_aag_metrics
 from abc_utils import to_ascii_aag
@@ -323,6 +326,409 @@ def set_flag(name, enabled):
 
 def set_int(name, value):
     os.environ[name] = str(int(value))
+
+
+def _native_summary_score(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        targets = data.get("targets", [])
+        if not targets:
+            return None
+        total_gates = sum(_csv_int(item.get("current_gates")) for item in targets)
+        total_removed = sum(_csv_int(item.get("removed")) for item in targets)
+        total_unresolved = sum(_csv_int(item.get("unresolved")) for item in targets)
+        finished = 0 if data.get("status") in {"RUNNING", "ERROR", "FAILED"} else 1
+        return (
+            finished,
+            -total_gates,
+            total_removed,
+            -total_unresolved,
+            os.path.getmtime(path),
+        )
+    except Exception:
+        return None
+
+
+def find_best_native_tfo_summary(results_dir=RESULTS_BASE_DIR):
+    patterns = [
+        os.path.join(results_dir, "parallel_tfo_native_tfo*", "summary.json"),
+        os.path.join(results_dir, "native_tfo_7h_prelaunch_smoke_20260615", "summary.json"),
+    ]
+    best_path = ""
+    best_score = None
+    for pattern in patterns:
+        for path in glob.glob(pattern):
+            score = _native_summary_score(path)
+            if score is None:
+                continue
+            if best_score is None or score > best_score:
+                best_path = path
+                best_score = score
+    return best_path
+
+
+def _prompt_runtime_minutes(default_minutes=360):
+    try:
+        raw = input(f"Runtime for native exact-TFO campaign in minutes [{default_minutes}]: ").strip()
+        if not raw:
+            return int(default_minutes)
+        return max(1, int(float(raw)))
+    except (EOFError, ValueError):
+        print(f"Keeping runtime at {default_minutes} minutes.")
+        return int(default_minutes)
+
+
+def _prompt_positive_int(prompt, default, minimum=1):
+    try:
+        raw = input(f"{prompt} [{default}]: ").strip()
+        if not raw:
+            return int(default)
+        return max(int(minimum), int(float(raw)))
+    except (EOFError, ValueError):
+        print(f"Keeping value at {default}.")
+        return int(default)
+
+
+NATIVE_TFO_TARGET_KEYS = (
+    "epfl_arithmetic_sin",
+    "epfl_arithmetic_sqrt",
+    "epfl_arithmetic_hyp",
+    "epfl_arithmetic_div",
+    "epfl_arithmetic_log2",
+    "epfl_random_control_mem_ctrl",
+)
+
+
+def _native_raw_suite_key(prefix, path):
+    base = os.path.splitext(os.path.basename(path))[0].lower()
+    if prefix:
+        base = f"{prefix}_{base}"
+    key = "".join(ch if ch.isalnum() else "_" for ch in base)
+    return "_".join(part for part in key.split("_") if part)
+
+
+def _native_raw_iscas_epfl_target_keys():
+    keys = []
+    for path in sorted(glob.glob(os.path.join("benchmarks", "*.aag"))):
+        keys.append(_native_raw_suite_key("iscas", path))
+    for path in sorted(glob.glob(os.path.join(BENCHMARK_SUITE_DIR, "epfl", "*.aag"))):
+        keys.append(_native_raw_suite_key("", path))
+    return keys
+
+
+def _prompt_native_tfo_targets(raw_suite=""):
+    if raw_suite == "iscas_epfl":
+        target_keys = _native_raw_iscas_epfl_target_keys()
+        custom_choice = len(target_keys) + 1
+        print("\n" + "=" * 60)
+        print("   RAW ISCAS + EPFL TARGETS")
+        print("=" * 60)
+        print(f" 0: All raw ISCAS + EPFL circuits ({len(target_keys)} targets)")
+        for idx, key in enumerate(target_keys, start=1):
+            print(f" {idx}: {key}")
+        print(f" {custom_choice}: Custom comma-separated raw target keys")
+        print("=" * 60)
+        raw = input(f"Select target set (0-{custom_choice}) [0]: ").strip()
+        if not raw:
+            raw = "0"
+        if raw == "0":
+            return []
+        try:
+            numeric = int(raw)
+        except ValueError:
+            numeric = -1
+        if 1 <= numeric <= len(target_keys):
+            return [target_keys[numeric - 1]]
+        if numeric == custom_choice:
+            custom = input("Raw target keys: ").strip()
+            selected = [part.strip() for part in custom.split(",") if part.strip()]
+            unknown = sorted(set(selected) - set(target_keys))
+            if unknown:
+                print(f"Unknown raw target(s): {', '.join(unknown)}. Defaulting to all.")
+                return []
+            return selected
+        print("Invalid target choice. Defaulting to all raw suite targets.")
+        return []
+
+    print("\n" + "=" * 60)
+    print("   NATIVE EXACT-TFO TARGETS")
+    print("=" * 60)
+    print(" 0: All hard native targets")
+    for idx, key in enumerate(NATIVE_TFO_TARGET_KEYS, start=1):
+        print(f" {idx}: {key}")
+    custom_choice = len(NATIVE_TFO_TARGET_KEYS) + 1
+    print(f" {custom_choice}: Custom comma-separated target keys")
+    print("=" * 60)
+    raw = input(f"Select target set (0-{custom_choice}) [0]: ").strip()
+    if not raw:
+        raw = "0"
+    if raw == "0":
+        return []
+    if raw in {str(i) for i in range(1, len(NATIVE_TFO_TARGET_KEYS) + 1)}:
+        return [NATIVE_TFO_TARGET_KEYS[int(raw) - 1]]
+    if raw == str(custom_choice):
+        custom = input("Target keys: ").strip()
+        selected = [part.strip() for part in custom.split(",") if part.strip()]
+        unknown = sorted(set(selected) - set(NATIVE_TFO_TARGET_KEYS))
+        if unknown:
+            print(f"Unknown target(s): {', '.join(unknown)}. Defaulting to all.")
+            return []
+        return selected
+    print("Invalid target choice. Defaulting to all.")
+    return []
+
+
+def _prompt_native_checkpoint_source():
+    print("\n" + "=" * 60)
+    print("   NATIVE EXACT-TFO SOURCE")
+    print("=" * 60)
+    print(" 1: Continue from best native summary")
+    print(" 2: Fresh pinned native checkpoints")
+    print(" 3: Explicit summary.json path")
+    print(" 4: Explicit checkpoint JSON path(s)")
+    print(" 5: Full raw ISCAS + EPFL AAG suite (from 0 removed)")
+    print("=" * 60)
+    choice = prompt_choice("Select source (1-5) [1]: ", {"1", "2", "3", "4", "5"}, "1")
+    if choice == "2":
+        return True, "", [], ""
+    if choice == "5":
+        return True, "", [], "iscas_epfl"
+    if choice == "3":
+        try:
+            path = input("Summary JSON path: ").strip()
+        except EOFError:
+            path = ""
+        if path and os.path.exists(path):
+            return False, path, [], ""
+        print("Summary path missing or not found; using best native summary.")
+    elif choice == "4":
+        try:
+            raw = input("Checkpoint JSON path(s), comma-separated: ").strip()
+        except EOFError:
+            raw = ""
+        paths = [part.strip() for part in raw.split(",") if part.strip()]
+        missing = [path for path in paths if not os.path.exists(path)]
+        if paths and not missing:
+            return False, "", paths, ""
+        if missing:
+            print(f"Missing checkpoint(s): {', '.join(missing)}. Using best native summary.")
+    seed_summary = os.environ.get("ALG10_NATIVE_SEED_SUMMARY", "").strip()
+    if not seed_summary:
+        seed_summary = find_best_native_tfo_summary()
+    if seed_summary:
+        print(f"    Seed summary: {seed_summary}")
+        return False, seed_summary, [], ""
+    print("    No native seed summary found; switching to fresh pinned checkpoints.")
+    return True, "", [], ""
+
+
+NATIVE_TFO_FINAL_STATUSES = {
+    "ALL_TARGETS_COMPLETE",
+    "FINISHED_WITH_FAILURES",
+    "NO_ACTIVE_TARGETS",
+    "NO_RUNNABLE_WORK",
+    "TIME_BUDGET_COMPLETE",
+    "STOPPED_BY_USER",
+}
+
+
+def _native_tfo_duration(seconds):
+    seconds = max(0, int(seconds))
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _load_native_tfo_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _render_native_tfo_status(root):
+    summary = _load_native_tfo_json(os.path.join(root, "summary.json"))
+    if not summary:
+        return f"Waiting for {os.path.join(root, 'summary.json')}..."
+
+    now = time.time()
+    started = float(summary.get("started", now) or now)
+    deadline = float(summary.get("deadline", now) or now)
+    status = str(summary.get("status", "UNKNOWN"))
+    metrics = summary.get("pool_metrics", {}) or {}
+    utilization = 100.0 * float(metrics.get("worker_utilization", 0.0) or 0.0)
+    elapsed = _native_tfo_duration(now - started)
+    if status in NATIVE_TFO_FINAL_STATUSES and summary.get("elapsed") is not None:
+        elapsed = _native_tfo_duration(float(summary.get("elapsed", 0.0) or 0.0))
+    lines = [
+        f"Campaign: {root}",
+        f"Status:   {status}",
+        f"Elapsed:  {elapsed}",
+        f"Remaining:{_native_tfo_duration(deadline - now)}",
+        f"Pool:     workers={summary.get('hardware', {}).get('selected', 0)} "
+        f"active_max={metrics.get('max_active_workers', 0)} "
+        f"dispatches={summary.get('dispatches', 0)} "
+        f"utilization={utilization:.1f}%",
+        "",
+        f"{'Circuit':32} {'Gen':>4} {'Gates':>9} {'Unresolved':>11} "
+        f"{'InFlight':>8} {'Dispatch':>8} {'State':>20}",
+        "-" * 101,
+    ]
+    for target in summary.get("targets", []):
+        lines.append(
+            f"{str(target.get('key', '?')):32} "
+            f"{int(target.get('generation', 0) or 0):4d} "
+            f"{int(target.get('current_gates', 0) or 0):9d} "
+            f"{int(target.get('unresolved', 0) or 0):11d} "
+            f"{int(target.get('inflight', 0) or 0):8d} "
+            f"{int(target.get('dispatches', 0) or 0):8d} "
+            f"{str(target.get('status', 'UNKNOWN')):>20}"
+        )
+    if status in NATIVE_TFO_FINAL_STATUSES:
+        lines.extend(["", "Campaign has finished."])
+    else:
+        lines.extend(["", "Press Ctrl-C to stop this display; the run continues in the background."])
+    return "\n".join(lines)
+
+
+def monitor_native_tfo_campaign(output_dir, process=None, interval=10.0):
+    root = os.path.abspath(output_dir)
+    try:
+        while True:
+            print("\033[2J\033[H", end="")
+            print(_render_native_tfo_status(root), flush=True)
+            summary = _load_native_tfo_json(os.path.join(root, "summary.json")) or {}
+            status = summary.get("status")
+            if status in NATIVE_TFO_FINAL_STATUSES:
+                return 0
+            if process is not None and process.poll() is not None:
+                print(
+                    f"\nCampaign process exited with code {process.returncode} "
+                    "before a final campaign status was written.",
+                    flush=True,
+                )
+                return process.returncode or 0
+            time.sleep(max(1.0, float(interval)))
+    except KeyboardInterrupt:
+        print("\nStopped status display. Native campaign keeps running in the background.")
+        return 0
+
+
+def build_native_tfo_campaign_command(
+    reset,
+    runtime_minutes,
+    timestamp,
+    seed_summary="",
+    checkpoint_jsons=None,
+    workers=None,
+    target_keys=None,
+    raw_suite="",
+):
+    seconds = max(1, int(runtime_minutes) * 60)
+    tag = raw_suite.replace("_", "-") if raw_suite else ("fresh" if reset else "continue")
+    selected_targets = list(target_keys or [])
+    target_label = "all" if not selected_targets else "_".join(
+        key.replace("epfl_", "").replace("iscas_", "").replace("_", "-")
+        for key in selected_targets[:4]
+    )
+    if len(selected_targets) > 4:
+        target_label = f"{target_label}_{len(selected_targets)}targets"
+    output_dir = os.path.join(
+        RESULTS_BASE_DIR,
+        f"parallel_tfo_native_tfo_main_{tag}_{target_label}_{timestamp}",
+    )
+    command = [
+        sys.executable,
+        "-u",
+        "alg10_native_tfo_7h_campaign.py",
+        "--output-dir",
+        output_dir,
+        "--seconds",
+        str(seconds),
+        "--workers",
+        str(workers if workers is not None else os.environ.get("ALG10_NATIVE_WORKERS", "12")),
+        "--worker-cache-entries",
+        os.environ.get("ALG10_NATIVE_WORKER_CACHE_ENTRIES", "2"),
+        "--persistent-retry-tiers",
+        os.environ.get("ALG10_NATIVE_PERSISTENT_RETRY_TIERS", "3"),
+        "--solver",
+        os.environ.get("ALG10_NATIVE_SOLVER", "cadical153"),
+    ]
+    if raw_suite:
+        command.extend(["--raw-suite", raw_suite])
+    elif not reset and seed_summary:
+        command.extend(["--seed-summary", seed_summary])
+    if not reset and not raw_suite:
+        for path in checkpoint_jsons or []:
+            command.extend(["--checkpoint-json", path])
+    for key in selected_targets:
+        command.extend(["--target", key])
+    return command, output_dir
+
+
+def run_native_tfo_campaign_from_menu(timestamp):
+    print("\n" + "=" * 60)
+    print("   ALG10 NATIVE EXACT-TFO CAMPAIGN")
+    print("=" * 60)
+    print("This mode runs the latest multi-circuit exact-TFO pool campaign.")
+    print("It writes to a new output folder and does not overwrite prior runs.")
+    reset, seed_summary, checkpoint_jsons, raw_suite = _prompt_native_checkpoint_source()
+    target_keys = _prompt_native_tfo_targets(raw_suite=raw_suite)
+    default_minutes = int(os.environ.get("ALG10_NATIVE_RUNTIME_MINUTES", "360"))
+    runtime_minutes = _prompt_runtime_minutes(default_minutes)
+    default_workers = int(os.environ.get("ALG10_NATIVE_WORKERS", "12"))
+    workers = _prompt_positive_int("Worker processes", default_workers, minimum=1)
+
+    command, output_dir = build_native_tfo_campaign_command(
+        reset,
+        runtime_minutes,
+        timestamp,
+        seed_summary=seed_summary,
+        checkpoint_jsons=checkpoint_jsons,
+        workers=workers,
+        target_keys=target_keys,
+        raw_suite=raw_suite,
+    )
+    print(f"    Output directory: {output_dir}")
+    print(f"    Runtime: {runtime_minutes} minutes")
+    print(f"    Workers: {workers}")
+    print(f"    Solver: {os.environ.get('ALG10_NATIVE_SOLVER', 'cadical153')}")
+    if raw_suite == "iscas_epfl":
+        target_label = ", ".join(target_keys) if target_keys else "all raw ISCAS + EPFL targets"
+    else:
+        target_label = ", ".join(target_keys) if target_keys else "all hard native targets"
+    print(f"    Targets: {target_label}")
+    if raw_suite == "iscas_epfl":
+        checkpoint_source = "raw ISCAS + EPFL AAG suite (seed_removed=0)"
+    elif reset:
+        checkpoint_source = "fresh pinned native checkpoints"
+    elif checkpoint_jsons:
+        checkpoint_source = ", ".join(checkpoint_jsons)
+    else:
+        checkpoint_source = seed_summary
+    print(f"    Checkpoint source: {checkpoint_source}")
+    print(f"    Command: {' '.join(command)}")
+    os.makedirs(output_dir, exist_ok=True)
+    log_path = os.path.join(output_dir, "native_campaign.log")
+    pid_path = os.path.join(output_dir, "native_campaign.pid")
+    with open(log_path, "ab", buffering=0) as log:
+        process = subprocess.Popen(
+            command,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            cwd=os.getcwd(),
+            start_new_session=True,
+        )
+    with open(pid_path, "w", encoding="utf-8") as handle:
+        handle.write(f"{process.pid}\n")
+
+    print(f"    Started in background. PID: {process.pid}")
+    print(f"    Log file: {log_path}")
+    print(f"    PID file: {pid_path}")
+    print("    Opening live status display; Ctrl-C stops only the display.")
+    monitor_native_tfo_campaign(output_dir, process=process, interval=10.0)
 
 def configure_algorithm9_run():
     """Collect Algorithm 9 mode and dataset profile before importing the module."""
@@ -704,6 +1110,7 @@ def select_optimizer():
     print(" 8: Alg 8 - Pure Python Hybrid Engine + ABC CEC Verification")
     print(" 9: Alg 9 - Committed In-Memory Incremental SAT")
     print("10: Alg10 - Checkpointed Budget-Cycling Global SAT")
+    print("11: Alg10 Native Exact-TFO Pool Campaign (latest)")
     print("="*60)
 
     mapping = {
@@ -716,10 +1123,11 @@ def select_optimizer():
         "7": "optimizer_alg7_iterative",
         "8": "optimizer_alg8_hybrid",
         "9": "optimizer_alg9_incremental",
-        "10": "optimizer_alg10_tiered"
+        "10": "optimizer_alg10_tiered",
+        "11": "__alg10_native_tfo_campaign__",
     }
 
-    choice = prompt_choice("Enter choice (1-10): ", set(mapping), "9")
+    choice = prompt_choice("Enter choice (1-11): ", set(mapping), "9")
     return mapping[choice], choice
 
 if __name__ == "__main__":
@@ -733,6 +1141,9 @@ if __name__ == "__main__":
         configure_algorithm9_run()
     elif algo_id == "10":
         configure_algorithm10_run()
+    elif algo_id == "11":
+        run_native_tfo_campaign_from_menu(timestamp)
+        raise SystemExit(0)
 
     print(f"\n[+] Loading Engine: {algo_module_name}.py")
     
@@ -957,6 +1368,16 @@ if __name__ == "__main__":
                 timings.get("Cone_Partition_Fallbacks", ""),
                 timings.get("Cone_Partition_Max_Seen_Cone_Gates", ""),
                 timings.get("Cone_Partition_Max_Skipped_Cone_Gates", ""),
+                timings.get("Cone_TFO_Max_Good_Gates_Config", ""),
+                timings.get("Cone_TFO_Max_Faulty_Gates_Config", ""),
+                timings.get("Cone_TFO_Checks", ""),
+                timings.get("Cone_TFO_Query_SAT", ""),
+                timings.get("Cone_TFO_Query_UNSAT", ""),
+                timings.get("Cone_TFO_Timeouts", ""),
+                timings.get("Cone_TFO_Skipped", ""),
+                timings.get("Cone_TFO_Audit_Fail", ""),
+                timings.get("Cone_TFO_Max_Good_Gates", ""),
+                timings.get("Cone_TFO_Max_Faulty_Gates", ""),
                 timings.get("Global_Checks", ""), timings.get("Global_Solver", ""),
                 timings.get("Global_Max_Consecutive_Timeouts", ""),
                 timings.get("Global_Frontier_Order", ""),
@@ -1085,6 +1506,10 @@ if __name__ == "__main__":
         "Cone_Partition_Cone_Too_Large", "Cone_Partition_Fallbacks",
         "Cone_Partition_Max_Seen_Cone_Gates",
         "Cone_Partition_Max_Skipped_Cone_Gates",
+        "Cone_TFO_Max_Good_Gates_Config", "Cone_TFO_Max_Faulty_Gates_Config",
+        "Cone_TFO_Checks", "Cone_TFO_Query_SAT", "Cone_TFO_Query_UNSAT",
+        "Cone_TFO_Timeouts", "Cone_TFO_Skipped", "Cone_TFO_Audit_Fail",
+        "Cone_TFO_Max_Good_Gates", "Cone_TFO_Max_Faulty_Gates",
         "Global_Checks", "Global_Solver", "Global_Max_Consecutive_Timeouts",
         "Global_Frontier_Order", "Global_Phase_Mode", "Global_Phase_Model_Limit",
         "Global_Query_SAT", "Global_Query_UNSAT", "Global_Timeouts",

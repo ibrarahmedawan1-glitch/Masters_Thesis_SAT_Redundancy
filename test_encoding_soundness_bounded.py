@@ -21,6 +21,8 @@ os.environ.setdefault("ALG10_WINDOW_MAX_CONE_GATES", "100000")
 os.environ.setdefault("ALG10_CONE_BUDGET", "100000")
 os.environ.setdefault("ALG10_CONE_MAX_GATES", "100000")
 os.environ.setdefault("ALG10_CONE_SOLVER", "glucose4")
+os.environ.setdefault("ALG10_CONE_TFO_MAX_GOOD_GATES", "100000")
+os.environ.setdefault("ALG10_CONE_TFO_MAX_FAULTY_GATES", "100000")
 os.environ.setdefault("ALG10_WINDOW_AUDIT", "1")
 os.environ.setdefault("ALG10_AUDIT_ASSUMPTIONS", "1")
 os.environ.setdefault("ALG10_CEX_PRUNING", "0")
@@ -204,6 +206,33 @@ def check_grouped_cone_encoding(inputs, gates, output, idx, stuck_value, expecte
     return sat == (not expected_redundant)
 
 
+def check_tfo_cone_encoding(inputs, gates, output, idx, stuck_value, expected_redundant):
+    timings = {"Encode": 0.0, "SAT": 0.0}
+    telemetry = alg10._empty_phase_telemetry()
+    by_lhs, fanout = alg10._fanout_graph(gates)
+    result, _ = alg10._tfo_miter_check(
+        inputs,
+        [],
+        [output],
+        gates,
+        idx,
+        stuck_value,
+        timings,
+        by_lhs,
+        fanout,
+        telemetry=telemetry,
+    )
+    if result == "SKIP":
+        return True
+    if telemetry["cone_tfo_audit_fail"]:
+        return False
+    if result == "UNSAT":
+        return expected_redundant
+    if result == "SAT":
+        return not expected_redundant
+    return False
+
+
 def check_window_soundness(inputs, gates, output, idx, stuck_value, expected_redundant):
     timings = {"Encode": 0.0, "SAT": 0.0}
     by_lhs, fanout = alg10._fanout_graph(gates)
@@ -260,6 +289,7 @@ def run_space(input_count, gate_count, output_mode, progress_interval):
         "persistent_tfi": 0,
         "cone": 0,
         "grouped_cone": 0,
+        "tfo_cone": 0,
         "window": 0,
         "rewrite": 0,
         "redundant_candidates": 0,
@@ -325,6 +355,20 @@ def run_space(input_count, gate_count, output_mode, progress_interval):
                             expected_redundant,
                         )
                     stats["grouped_cone"] += 1
+
+                    if not check_tfo_cone_encoding(
+                        inputs, gates, output, idx, stuck_value, expected_redundant
+                    ):
+                        fail(
+                            "tfo_cone_miter",
+                            input_count,
+                            gates,
+                            output,
+                            idx,
+                            stuck_value,
+                            expected_redundant,
+                        )
+                    stats["tfo_cone"] += 1
 
                     before_window = stats["window_unsat_accepts"]
                     if not check_window_soundness(inputs, gates, output, idx, stuck_value, expected_redundant):
